@@ -81,6 +81,45 @@ pub fn encode(gpa: Allocator, img: Image) ![]u8 {
     return error.PngEncodeFailed;
 }
 
+/// Decode PNG bytes into a premultiplied ARGB32 image.
+pub fn decode(gpa: Allocator, bytes: []const u8) !Image {
+    var png: c.png_image = std.mem.zeroes(c.png_image);
+    png.version = c.PNG_IMAGE_VERSION;
+    if (c.png_image_begin_read_from_memory(&png, bytes.ptr, bytes.len) == 0) return error.PngDecodeFailed;
+    defer c.png_image_free(&png);
+    png.format = c.PNG_FORMAT_BGRA;
+
+    var img = try Image.alloc(gpa, png.width, png.height);
+    errdefer img.deinit(gpa);
+    if (c.png_image_finish_read(&png, null, img.pixels.ptr, @intCast(img.stride), null) == 0) return error.PngDecodeFailed;
+
+    // libpng gives straight alpha; cairo and wl_shm want premultiplied.
+    var all_opaque = true;
+    var i: usize = 0;
+    while (i < img.pixels.len) : (i += 4) {
+        const a: u32 = img.pixels[i + 3];
+        if (a == 255) continue;
+        all_opaque = false;
+        inline for (0..3) |k| img.pixels[i + k] = @intCast((@as(u32, img.pixels[i + k]) * a + 127) / 255);
+    }
+    img.is_opaque = all_opaque;
+    return img;
+}
+
+test "decode round-trips encode" {
+    const gpa = std.testing.allocator;
+    var img = try Image.alloc(gpa, 5, 3);
+    defer img.deinit(gpa);
+    for (img.pixels, 0..) |*p, i| p.* = @intCast((i * 37) & 0xff);
+    img.forceOpaque();
+    const bytes = try encode(gpa, img);
+    defer gpa.free(bytes);
+    var back = try decode(gpa, bytes);
+    defer back.deinit(gpa);
+    try std.testing.expect(back.is_opaque);
+    try std.testing.expectEqualSlices(u8, img.pixels, back.pixels);
+}
+
 test "encode produces a PNG signature" {
     const gpa = std.testing.allocator;
     var img = try Image.alloc(gpa, 3, 2);

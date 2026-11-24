@@ -100,6 +100,28 @@ Done when `Mod+Shift+S { spawn "pict" "--region"; }` works.
 - Cross-output selections with mixed scales; output transforms.
 - `ext-image-copy-capture` backend, auto-selected when advertised.
 
+**Status (2026-11-24):**
+- **Canvas (`layout.zig`):** one pixel grid across every output, at the highest output scale.
+  Each output's origin is rounded to a whole pixel, so outputs at the canvas scale stay exact
+  and lower-scale outputs are upscaled.
+- **Exact scales:** the overlay uses `wp_fractional_scale_v1`'s exact scale instead of pw/lw,
+  because niri rounds 2560/1.5 up to 1707.
+- **Done and verified with the test hook:**
+  - A region spanning DP-2 and DP-3 matches `grim -g` exactly.
+  - A mixed-scale run (DP-3 at 1.5) gives a 600×450 result. The 1.5 part is exact, and the
+    1.0 part is upscaled with a mean error of 0.01% against grim.
+  - The lasso produces an RGBA PNG that is transparent outside the shape.
+  - `--fullscreen --all` gives one 5120×1440 image.
+  - Window mode works through IPC. On 26.04 it falls back to niri's `ScreenshotWindow`
+    writing to `$XDG_RUNTIME_DIR`, and pict then loads that file.
+- **Not yet tested by hand:**
+  - Hover-snap on a floating window (none were open).
+  - Drawing a lasso by hand.
+- **Deferred:**
+  - `ext-image-copy-capture`: niri 26.04 doesn't offer it, so there is nothing here to test
+    against.
+  - Output transforms (rotated monitors): needs a rotation test on a real output.
+
 ### Phase 3
 
 Editor: xdg_toplevel with a Cairo canvas.

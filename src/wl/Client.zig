@@ -24,6 +24,7 @@ layer_shell: ?*zwlr.LayerShellV1 = null,
 screencopy: ?*zwlr.ScreencopyManagerV1 = null,
 viewporter: ?*wp.Viewporter = null,
 cursor_shape: ?*wp.CursorShapeManagerV1 = null,
+fractional_scale: ?*wp.FractionalScaleManagerV1 = null,
 
 outputs: std.ArrayList(*Output) = .empty,
 
@@ -79,6 +80,7 @@ pub fn connect(gpa: Allocator) !*Client {
 pub fn deinit(self: *Client) void {
     for (self.outputs.items) |o| o.deinit(self.gpa);
     self.outputs.deinit(self.gpa);
+    if (self.fractional_scale) |g| g.destroy();
     if (self.cursor_shape) |g| g.destroy();
     if (self.viewporter) |g| g.destroy();
     if (self.screencopy) |g| g.destroy();
@@ -142,6 +144,8 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Cli
                 self.viewporter = registry.bind(g.name, wp.Viewporter, g.version) catch null;
             } else if (is(iface, wp.CursorShapeManagerV1)) {
                 self.cursor_shape = registry.bind(g.name, wp.CursorShapeManagerV1, g.version) catch null;
+            } else if (is(iface, wp.FractionalScaleManagerV1)) {
+                self.fractional_scale = registry.bind(g.name, wp.FractionalScaleManagerV1, g.version) catch null;
             } else if (is(iface, wl.Output)) {
                 const wl_output = registry.bind(g.name, wl.Output, g.version) catch return;
                 const o = self.gpa.create(Output) catch {

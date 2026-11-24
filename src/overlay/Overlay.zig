@@ -1,10 +1,12 @@
-//! Freeze-frame region selector.
+//! Freeze-frame selector: region, freeform lasso, and window modes.
 //!
 //! One layer-shell surface per output (overlay layer, all edges, exclusive keyboard).
 //! Each shows that output's frozen screencopy buffer untouched, scaled 1:1 with
 //! wp_viewporter, so fractional scales never resample. A desynchronized subsurface on
-//! top carries the dim, the selection border and the size label. It's redrawn only
-//! where the selection changed, and only that damage is sent to the compositor.
+//! top carries the dim, the selection outline and the label. It's redrawn only where
+//! the selection changed, and only that damage is sent to the compositor.
+//!
+//! Selections are kept in canvas pixels (layout.zig) so they can span outputs.
 
 const Overlay = @This();
 
@@ -21,19 +23,55 @@ const shm = @import("../wl/shm.zig");
 const Frame = @import("../capture/screencopy.zig").Frame;
 const geom = @import("../geom.zig");
 const Rect = geom.Rect;
+const layout_mod = @import("../layout.zig");
+const Layout = layout_mod.Layout;
 const selection = @import("selection.zig");
 const Timings = @import("../main.zig").Timings;
 
-pub const Options = struct {
-    /// Keep the selection editable after release (arrows, Shift+arrows, Enter).
-    adjust: bool = false,
-    timings: ?*Timings = null,
-    /// Test hook (PICT_TEST_AUTOSELECT): once every output has presented, drag to `rect`
-    /// on `frame` in two steps, then confirm. Exercises the real render/damage path.
-    autoselect: ?Result = null,
+pub const Mode = enum { region, freeform, window };
+
+/// A window that can be hovered in window mode.
+pub const WindowTarget = struct {
+    id: u64,
+    /// Index into `frames` of the output it's on.
+    output: usize,
+    /// Output-local logical rect: x, y, w, h.
+    lrect: [4]f64,
+    label: []const u8,
 };
 
-pub const Result = struct { frame: usize, rect: Rect };
+/// Test hook (PICT_TEST_AUTOSELECT): drives the overlay without input once every output
+/// has presented. Coordinates are physical pixels on `output`.
+pub const Auto = struct {
+    output: usize,
+    /// Region: drag this rect. Freeform: trace the inscribed ellipse. Window: click its
+    /// top-left corner.
+    rect: Rect,
+};
+
+pub const Options = struct {
+    mode: Mode = .region,
+    /// Region mode: keep the selection editable after release (arrows, Shift+arrows, Enter).
+    adjust: bool = false,
+    timings: ?*Timings = null,
+    /// Window mode: hoverable windows, topmost first.
+    windows: []const WindowTarget = &.{},
+    /// Window mode: niri window to capture when a click hits no known window (niri 26.04
+    /// doesn't report tiled window positions).
+    fallback_window: ?u64 = null,
+    autoselect: ?Auto = null,
+};
+
+pub const Result = union(enum) {
+    /// Canvas rect.
+    rect: Rect,
+    /// Canvas bbox plus polygon points (owned by the caller's allocator).
+    lasso: struct { bbox: Rect, points: [][2]f64 },
+    /// Ask niri to render this window.
+    niri_window: u64,
+};
+
+pub const Selected = struct { result: Result, layout: Layout };
 
 const dim_alpha = 0.40;
 /// Size label, in logical pixels.
@@ -46,8 +84,14 @@ gpa: Allocator,
 client: *Client,
 opts: Options,
 outs: []OutSurface,
+layout: Layout = .{},
+
 sel: selection.Selection = .{},
+lasso: selection.Lasso = .{},
+hover: ?usize = null,
+outcome: ?Result = null,
 state: enum { pending, confirmed, cancelled } = .pending,
+
 mapped_marked: bool = false,
 auto_stage: u8 = 0,
 
@@ -66,7 +110,7 @@ measure_surf: ?*c.cairo_surface_t = null,
 measure_cr: ?*c.cairo_t = null,
 
 /// Run the selector over `frames` (one per output). Returns null if cancelled.
-pub fn select(client: *Client, frames: []Frame, opts: Options) !?Result {
+pub fn select(client: *Client, frames: []Frame, opts: Options) !?Selected {
     const gpa = client.gpa;
     const compositor = client.compositor orelse return error.NoCompositor;
     const layer_shell = client.layer_shell orelse return error.NoLayerShell;
@@ -74,6 +118,7 @@ pub fn select(client: *Client, frames: []Frame, opts: Options) !?Result {
     const subcompositor = client.subcompositor orelse return error.NoSubcompositor;
     const seat = client.seat orelse return error.NoSeat;
     if (!client.seat_caps.pointer) return error.NoSeat;
+    if (frames.len > layout_mod.max_outputs) return error.TooManyOutputs;
 
     var ov: Overlay = .{ .gpa = gpa, .client = client, .opts = opts, .outs = &.{} };
     defer ov.teardown();
@@ -87,6 +132,7 @@ pub fn select(client: *Client, frames: []Frame, opts: Options) !?Result {
     for (frames, ov.outs, 0..) |*f, *os, i| {
         try os.init(&ov, i, f, compositor, subcompositor, layer_shell, viewporter);
     }
+    ov.relayout();
 
     const pointer = try seat.getPointer();
     ov.pointer = pointer;
@@ -100,16 +146,25 @@ pub fn select(client: *Client, frames: []Frame, opts: Options) !?Result {
 
     while (ov.state == .pending) {
         try client.dispatch();
-        if (opts.autoselect) |a| ov.stepAutoselect(a);
-        for (ov.outs) |*os| if (os.dirty) os.render();
+        while (ov.state == .pending) {
+            for (ov.outs) |*os| if (os.dirty) os.render();
+            const a = opts.autoselect orelse break;
+            if (!ov.stepAutoselect(a)) break; // must wait for a frame callback
+        }
     }
 
     if (ov.state == .cancelled) return null;
-    const r = ov.sel.rect() orelse return null;
-    return .{ .frame = ov.sel.frame.?, .rect = r };
+    const result = ov.outcome orelse return null;
+    ov.outcome = null; // ownership of lasso points moves to the caller
+    return .{ .result = result, .layout = ov.layout };
 }
 
 fn teardown(ov: *Overlay) void {
+    if (ov.outcome) |o| switch (o) {
+        .lasso => |l| ov.gpa.free(l.points),
+        else => {},
+    };
+    ov.lasso.deinit(ov.gpa);
     if (ov.cursor_dev) |d| d.destroy();
     if (ov.pointer) |p| p.release();
     if (ov.keyboard) |k| k.release();
@@ -124,24 +179,23 @@ fn teardown(ov: *Overlay) void {
     if (ov.measure_surf) |s| c.cairo_surface_destroy(s);
 }
 
-fn stepAutoselect(ov: *Overlay, a: Result) void {
-    for (ov.outs) |*os| if (os.presented == 0) return;
-    const os = &ov.outs[a.frame];
-    if (os.frame_cb != null or os.dirty) return; // wait until the last change was presented
-    const r = a.rect;
-    switch (ov.auto_stage) {
-        0 => {
-            ov.sel.begin(a.frame, os.bounds(), .{ r.x, r.y });
-            ov.sel.update(.{ r.x + @divTrunc(r.w, 2), r.y + @divTrunc(r.h, 2) });
-        },
-        1 => ov.sel.update(.{ r.x2(), r.y2() }),
-        else => {
-            ov.sel.dragging = false;
-            ov.confirm();
-            return;
-        },
+fn relayout(ov: *Overlay) void {
+    var geoms: [layout_mod.max_outputs]layout_mod.OutputGeom = undefined;
+    for (ov.outs, 0..) |*os, i| {
+        const o = os.output;
+        const lw: i32 = if (o.logical_w > 0) o.logical_w else @intCast(os.logical_w);
+        const lh: i32 = if (o.logical_h > 0) o.logical_h else @intCast(os.logical_h);
+        geoms[i] = layout_mod.OutputGeom.fromSizes(
+            @floatFromInt(o.logical_x),
+            @floatFromInt(o.logical_y),
+            @floatFromInt(if (lw > 0) lw else @as(i32, @intCast(os.pw))),
+            @floatFromInt(if (lh > 0) lh else @as(i32, @intCast(os.ph))),
+            @intCast(os.pw),
+            @intCast(os.ph),
+            os.exact_scale,
+        );
     }
-    ov.auto_stage += 1;
+    ov.layout = Layout.init(geoms[0..ov.outs.len]);
     ov.markAllDirty();
 }
 
@@ -149,40 +203,204 @@ fn markAllDirty(ov: *Overlay) void {
     for (ov.outs) |*os| os.dirty = true;
 }
 
-fn geomOf(ov: *Overlay, idx: usize) selection.OutputGeom {
-    const os = &ov.outs[idx];
-    const o = os.output;
-    const lw: f64 = @floatFromInt(if (o.logical_w > 0) o.logical_w else @as(i32, @intCast(os.logical_w)));
-    const lh: f64 = @floatFromInt(if (o.logical_h > 0) o.logical_h else @as(i32, @intCast(os.logical_h)));
-    return .{
-        .lx = @floatFromInt(o.logical_x),
-        .ly = @floatFromInt(o.logical_y),
-        .lw = if (lw > 0) lw else @floatFromInt(os.pw),
-        .lh = if (lh > 0) lh else @floatFromInt(os.ph),
-        .pw = @intCast(os.pw),
-        .ph = @intCast(os.ph),
+fn pointerCanvas(ov: *Overlay) ?[2]f64 {
+    const i = ov.pointer_out orelse return null;
+    return ov.layout.toCanvas(i, ov.pointer_pos[0], ov.pointer_pos[1]);
+}
+
+fn roundPt(p: [2]f64) [2]i32 {
+    return .{ @intFromFloat(@round(p[0])), @intFromFloat(@round(p[1])) };
+}
+
+fn windowRect(ov: *const Overlay, w: WindowTarget) Rect {
+    return ov.layout.logicalRectToCanvas(w.output, w.lrect[0], w.lrect[1], w.lrect[2], w.lrect[3]);
+}
+
+/// Topmost known window under canvas point p (window mode).
+fn windowAt(ov: *const Overlay, p: [2]i32) ?usize {
+    for (ov.opts.windows, 0..) |w, i| {
+        const r = ov.windowRect(w).clampTo(ov.layout.rects[w.output]);
+        if (p[0] >= r.x and p[0] < r.x2() and p[1] >= r.y and p[1] < r.y2()) return i;
+    }
+    return null;
+}
+
+fn updateHover(ov: *Overlay) void {
+    const p = ov.pointerCanvas() orelse return;
+    const h = ov.windowAt(roundPt(p));
+    if (h != ov.hover) {
+        ov.hover = h;
+        ov.markAllDirty();
+    }
+    // The fallback hint follows the cursor.
+    if (h == null and ov.opts.fallback_window != null) ov.markAllDirty();
+}
+
+const Shape = union(enum) { none, rect: Rect, lasso: Rect };
+
+fn shape(ov: *const Overlay) Shape {
+    switch (ov.opts.mode) {
+        .region => if (ov.sel.rect()) |r| return .{ .rect = r },
+        .freeform => if (ov.lasso.bbox()) |b| return .{ .lasso = b },
+        .window => if (ov.hover) |i| {
+            const w = ov.opts.windows[i];
+            return .{ .rect = ov.windowRect(w).clampTo(ov.layout.rects[w.output]) };
+        },
+    }
+    return .none;
+}
+
+fn labelText(ov: *const Overlay, buf: []u8) ?[:0]const u8 {
+    const times = "\u{00d7}";
+    switch (ov.shape()) {
+        .rect, .lasso => |r| {
+            if (ov.opts.mode == .window) {
+                const name = ov.opts.windows[ov.hover.?].label;
+                const short = name[0..@min(name.len, 40)];
+                return std.fmt.bufPrintSentinel(buf, "{s}   {d} " ++ times ++ " {d}", .{ short, r.w, r.h }, 0) catch null;
+            }
+            return std.fmt.bufPrintSentinel(buf, "{d} " ++ times ++ " {d}", .{ r.w, r.h }, 0) catch null;
+        },
+        .none => {
+            if (ov.opts.mode == .window and ov.opts.fallback_window != null)
+                return std.fmt.bufPrintSentinel(buf, "click: focused window", .{}, 0) catch null;
+            return null;
+        },
+    }
+}
+
+/// Output that shows the label for canvas rect r: the one under its bottom-left corner,
+/// else its top-left, else the pointer's.
+fn labelOutput(ov: *const Overlay, r: Rect) ?usize {
+    return ov.layout.outputAt(r.x, r.y2() - 1) orelse ov.layout.outputAt(r.x, r.y) orelse ov.pointer_out;
+}
+
+fn finish(ov: *Overlay, result: Result) void {
+    ov.outcome = result;
+    ov.state = .confirmed;
+}
+
+fn confirmRegion(ov: *Overlay) void {
+    if (ov.sel.rect()) |r| ov.finish(.{ .rect = r });
+}
+
+fn confirmLasso(ov: *Overlay) void {
+    const b = ov.lasso.bbox() orelse {
+        ov.lasso.clear();
+        ov.markAllDirty();
+        return;
     };
+    const pts = ov.gpa.dupe([2]f64, ov.lasso.points.items) catch {
+        ov.state = .cancelled;
+        return;
+    };
+    ov.finish(.{ .lasso = .{ .bbox = b, .points = pts } });
 }
 
-/// Pointer position mapped onto output `to`'s frame.
-fn pointerOn(ov: *Overlay, to: usize) ?[2]i32 {
-    const from = ov.pointer_out orelse return null;
-    return selection.toPhysical(ov.geomOf(from), ov.geomOf(to), ov.pointer_pos[0], ov.pointer_pos[1]);
+fn clickWindow(ov: *Overlay) void {
+    if (ov.hover) |i| {
+        const w = ov.opts.windows[i];
+        ov.finish(.{ .rect = ov.windowRect(w).clampTo(ov.layout.rects[w.output]) });
+    } else if (ov.opts.fallback_window) |id| {
+        ov.finish(.{ .niri_window = id });
+    }
 }
 
-fn confirm(ov: *Overlay) void {
-    if (ov.sel.rect() != null) ov.state = .confirmed;
+/// Advance the test hook one stage. Returns false while it must wait for the compositor.
+fn stepAutoselect(ov: *Overlay, a: Auto) bool {
+    for (ov.outs) |*os| if (os.presented == 0) return false;
+    const os = &ov.outs[a.output];
+    if (os.frame_cb != null or os.dirty) return false; // wait until the last change was presented
+
+    const o: [2]f64 = .{ @floatFromInt(ov.layout.rects[a.output].x), @floatFromInt(ov.layout.rects[a.output].y) };
+    const k = ov.layout.ratio(a.output);
+    const toC = struct {
+        fn f(origin: [2]f64, kk: f64, x: f64, y: f64) [2]f64 {
+            return .{ origin[0] + x / kk, origin[1] + y / kk };
+        }
+    }.f;
+    const r = a.rect;
+    const x0: f64 = @floatFromInt(r.x);
+    const y0: f64 = @floatFromInt(r.y);
+    const w: f64 = @floatFromInt(r.w);
+    const h: f64 = @floatFromInt(r.h);
+
+    switch (ov.opts.mode) {
+        .region => switch (ov.auto_stage) {
+            0 => {
+                ov.sel.begin(ov.layout.bounds, roundPt(toC(o, k, x0, y0)));
+                ov.sel.update(roundPt(toC(o, k, x0 + w / 2, y0 + h / 2)));
+            },
+            1 => ov.sel.update(roundPt(toC(o, k, x0 + w, y0 + h))),
+            else => {
+                ov.sel.dragging = false;
+                ov.confirmRegion();
+                return true;
+            },
+        },
+        .freeform => {
+            const steps = 64;
+            const ellipse = struct {
+                fn pt(i: usize, ox: f64, oy: f64, ww: f64, hh: f64) [2]f64 {
+                    const t = @as(f64, @floatFromInt(i)) / steps * 2 * std.math.pi;
+                    return .{ ox + ww / 2 + @cos(t) * ww / 2, oy + hh / 2 + @sin(t) * hh / 2 };
+                }
+            }.pt;
+            switch (ov.auto_stage) {
+                0 => {
+                    const p0 = ellipse(0, x0, y0, w, h);
+                    ov.lasso.begin(ov.gpa, ov.layout.bounds, toC(o, k, p0[0], p0[1])) catch return false;
+                    for (1..steps / 2) |i| {
+                        const p = ellipse(i, x0, y0, w, h);
+                        _ = ov.lasso.add(ov.gpa, toC(o, k, p[0], p[1])) catch return false;
+                    }
+                },
+                1 => for (steps / 2..steps) |i| {
+                    const p = ellipse(i, x0, y0, w, h);
+                    _ = ov.lasso.add(ov.gpa, toC(o, k, p[0], p[1])) catch return false;
+                },
+                else => {
+                    ov.lasso.dragging = false;
+                    ov.confirmLasso();
+                    return true;
+                },
+            }
+        },
+        .window => switch (ov.auto_stage) {
+            0 => {
+                ov.pointer_out = a.output;
+                const s = ov.layout.geoms[a.output].scale;
+                ov.pointer_pos = .{ (x0 + 0.5) / s, (y0 + 0.5) / s };
+                ov.updateHover();
+            },
+            else => {
+                ov.clickWindow();
+                if (ov.state == .pending) ov.state = .cancelled; // nothing to click: don't hang
+                return true;
+            },
+        },
+    }
+    ov.auto_stage += 1;
+    ov.markAllDirty();
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // Per-output surfaces
 
+const Kind = enum { none, rect, lasso };
+
 const Drawn = struct {
+    kind: Kind = .none,
+    /// Selection rect (or lasso bbox) in this output's physical px; may extend past it.
     sel: ?Rect = null,
+    /// Lasso point count (points are only ever appended).
+    n: usize = 0,
     label: ?Rect = null,
+    text_hash: u64 = 0,
 
     fn eql(a: Drawn, b: Drawn) bool {
-        return optEql(a.sel, b.sel) and optEql(a.label, b.label);
+        return a.kind == b.kind and optEql(a.sel, b.sel) and a.n == b.n and optEql(a.label, b.label) and a.text_hash == b.text_hash;
     }
     fn optEql(a: ?Rect, b: ?Rect) bool {
         if (a == null and b == null) return true;
@@ -205,6 +423,7 @@ const OutSurface = struct {
     surface: ?*wl.Surface = null,
     layer: ?*zwlr.LayerSurfaceV1 = null,
     viewport: ?*wp.Viewport = null,
+    fractional: ?*wp.FractionalScaleV1 = null,
     ui_surface: ?*wl.Surface = null,
     ui_sub: ?*wl.Subsurface = null,
     ui_viewport: ?*wp.Viewport = null,
@@ -218,6 +437,8 @@ const OutSurface = struct {
     committed: ?Drawn = null,
     logical_w: u32 = 0,
     logical_h: u32 = 0,
+    /// Exact scale from wp_fractional_scale_v1, if the compositor sent one.
+    exact_scale: ?f64 = null,
     /// Frame (physical) size.
     pw: u32 = 0,
     ph: u32 = 0,
@@ -238,6 +459,12 @@ const OutSurface = struct {
         const surface = try compositor.createSurface();
         os.surface = surface;
         os.viewport = try viewporter.getViewport(surface);
+        if (ov.client.fractional_scale) |fs| {
+            if (fs.getFractionalScale(surface)) |f| {
+                os.fractional = f;
+                f.setListener(*OutSurface, fractionalListener, os);
+            } else |_| {}
+        }
 
         const ui = try compositor.createSurface();
         os.ui_surface = ui;
@@ -262,6 +489,7 @@ const OutSurface = struct {
 
     fn deinit(os: *OutSurface, gpa: Allocator) void {
         if (os.frame_cb) |cb| cb.destroy();
+        if (os.fractional) |f| f.destroy();
         if (os.ui_viewport) |v| v.destroy();
         if (os.ui_sub) |s| s.destroy();
         if (os.ui_surface) |s| s.destroy();
@@ -277,6 +505,7 @@ const OutSurface = struct {
     }
 
     fn pxScale(os: *const OutSurface) f64 {
+        if (os.exact_scale) |s| return s;
         if (os.logical_w == 0) return 1;
         return @as(f64, @floatFromInt(os.pw)) / @as(f64, @floatFromInt(os.logical_w));
     }
@@ -285,26 +514,48 @@ const OutSurface = struct {
         return @max(1, @as(i32, @intFromFloat(@round(os.pxScale()))));
     }
 
-    /// What this output should show right now.
-    fn wanted(os: *OutSurface) Drawn {
-        const ov = os.ov;
-        if (ov.sel.frame != os.idx) return .{};
-        const r = ov.sel.rect() orelse return .{};
-        return .{ .sel = r, .label = os.labelRect(r) };
-    }
-
-    fn labelText(buf: []u8, r: Rect) [:0]const u8 {
-        return std.fmt.bufPrintSentinel(buf, "{d} \u{00d7} {d}", .{ r.w, r.h }, 0) catch "";
-    }
-
     fn fontSize(os: *const OutSurface) f64 {
         return label_font * os.pxScale();
     }
 
-    fn labelRect(os: *OutSurface, r: Rect) Rect {
+    /// What this output should show right now.
+    fn wanted(os: *OutSurface) Drawn {
+        const ov = os.ov;
+        var tbuf: [96]u8 = undefined;
+        const text = ov.labelText(&tbuf);
+        const th: u64 = if (text) |t| std.hash.Wyhash.hash(0, t) else 0;
+
+        switch (ov.shape()) {
+            .none => {
+                // Window-mode hint follows the cursor on the pointer's output.
+                if (text != null and ov.pointer_out == os.idx) {
+                    const p = ov.layout.toLocal(os.idx, (ov.pointerCanvas() orelse return .{})[0], ov.pointerCanvas().?[1]);
+                    const off = 18.0 * os.pxScale();
+                    const anchor = Rect{ .x = @intFromFloat(p[0] + off), .y = @intFromFloat(p[1] + off), .w = 0, .h = 0 };
+                    return .{ .label = os.labelRect(anchor, text.?, false), .text_hash = th };
+                }
+                return .{};
+            },
+            .rect, .lasso => |r| {
+                const kind: Kind = if (ov.shape() == .rect) .rect else .lasso;
+                const local = ov.layout.rectToLocal(os.idx, r);
+                const bw = os.borderWidth();
+                const visible = !local.inflate(bw + 1).intersect(os.bounds()).isEmpty();
+                var d: Drawn = .{ .kind = if (visible) kind else .none, .sel = if (visible) local else null };
+                if (kind == .lasso and visible) d.n = ov.lasso.points.items.len;
+                if (text != null and ov.labelOutput(r) == os.idx) {
+                    d.label = os.labelRect(local, text.?, true);
+                    d.text_hash = th;
+                }
+                return d;
+            },
+        }
+    }
+
+    /// Label box for `text`: below `r` (or above / inside when there's no room), clamped
+    /// to this output. With below = false, `r` is just an anchor point.
+    fn labelRect(os: *OutSurface, r: Rect, text: [:0]const u8, below: bool) Rect {
         const cr = os.ov.measure_cr.?;
-        var tbuf: [48]u8 = undefined;
-        const text = labelText(&tbuf, r);
         setFont(cr, os.fontSize());
         var ext: c.cairo_text_extents_t = undefined;
         c.cairo_text_extents(cr, text.ptr, &ext);
@@ -316,11 +567,11 @@ const OutSurface = struct {
         const bw = os.borderWidth();
         const b = os.bounds();
 
-        var y = r.y2() + bw + gap;
-        if (y + h > b.h) y = r.y - bw - gap - h; // no room below: go above
-        if (y < 0) y = r.y + gap; // no room above either: inside
+        var y = if (below) r.y2() + bw + gap else r.y;
+        if (y + h > b.h) y = if (below) r.y - bw - gap - h else b.h - h; // no room below: go above
+        if (y < 0) y = if (below) @max(0, r.y) + gap else 0; // no room above either: inside
         const x = std.math.clamp(r.x, 0, @max(0, b.w - w));
-        return .{ .x = x, .y = y, .w = w, .h = h };
+        return .{ .x = x, .y = std.math.clamp(y, 0, @max(0, b.h - h)), .w = w, .h = h };
     }
 
     /// Rects that differ between two drawn states (clamped to the frame).
@@ -334,11 +585,17 @@ const OutSurface = struct {
 
         var n: usize = 0;
         const bw = os.borderWidth();
+        const lasso = prev.kind == .lasso or b.kind == .lasso;
+        const grow = if (lasso) bw + 2 else bw;
         if (prev.sel != null or b.sel != null) {
             if (prev.sel == null or b.sel == null) {
-                out[n] = (prev.sel orelse b.sel.?).inflate(bw).clampTo(full);
+                out[n] = (prev.sel orelse b.sel.?).inflate(grow).clampTo(full);
+                n += 1;
+            } else if (lasso or prev.kind != b.kind) {
+                out[n] = prev.sel.?.inflate(grow).bbox(b.sel.?.inflate(grow)).clampTo(full);
                 n += 1;
             } else {
+                // Rect → rect: pixels inside both holes are unchanged.
                 const outer = prev.sel.?.inflate(bw).bbox(b.sel.?.inflate(bw)).clampTo(full);
                 var parts: [4]Rect = undefined;
                 for (geom.subtract(outer, prev.sel.?.intersect(b.sel.?), &parts)) |p| {
@@ -409,36 +666,56 @@ const OutSurface = struct {
         const cr = c.cairo_create(surf) orelse return;
         defer c.cairo_destroy(cr);
 
-        for (region) |r| c.cairo_rectangle(cr, @floatFromInt(r.x), @floatFromInt(r.y), @floatFromInt(r.w), @floatFromInt(r.h));
+        for (region) |r| rect(cr, r);
         c.cairo_clip(cr);
 
         c.cairo_set_operator(cr, c.CAIRO_OPERATOR_SOURCE);
         c.cairo_set_source_rgba(cr, 0, 0, 0, dim_alpha);
         c.cairo_paint(cr);
 
-        if (want.sel) |s| {
-            // Clear the hole so the frozen frame shows through untouched.
-            rect(cr, s);
-            c.cairo_set_source_rgba(cr, 0, 0, 0, 0);
-            c.cairo_fill(cr);
-            // Border sits outside the selection, never over selected pixels.
-            c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
-            c.cairo_set_fill_rule(cr, c.CAIRO_FILL_RULE_EVEN_ODD);
-            rect(cr, s.inflate(os.borderWidth()));
-            rect(cr, s);
-            c.cairo_set_source_rgba(cr, 1, 1, 1, 0.95);
-            c.cairo_fill(cr);
-            c.cairo_set_fill_rule(cr, c.CAIRO_FILL_RULE_WINDING);
+        const bw = os.borderWidth();
+        switch (want.kind) {
+            .none => {},
+            .rect => {
+                const s = want.sel.?;
+                // Clear the hole so the frozen frame shows through untouched.
+                rect(cr, s);
+                c.cairo_set_source_rgba(cr, 0, 0, 0, 0);
+                c.cairo_fill(cr);
+                // Border sits outside the selection, never over selected pixels.
+                c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
+                c.cairo_set_fill_rule(cr, c.CAIRO_FILL_RULE_EVEN_ODD);
+                rect(cr, s.inflate(bw));
+                rect(cr, s);
+                c.cairo_set_source_rgba(cr, 1, 1, 1, 0.95);
+                c.cairo_fill(cr);
+                c.cairo_set_fill_rule(cr, c.CAIRO_FILL_RULE_WINDING);
+            },
+            .lasso => {
+                const pts = os.ov.lasso.points.items[0..@min(want.n, os.ov.lasso.points.items.len)];
+                for (pts, 0..) |p, i| {
+                    const q = os.ov.layout.toLocal(os.idx, p[0], p[1]);
+                    if (i == 0) c.cairo_move_to(cr, q[0], q[1]) else c.cairo_line_to(cr, q[0], q[1]);
+                }
+                c.cairo_close_path(cr);
+                c.cairo_set_source_rgba(cr, 0, 0, 0, 0);
+                c.cairo_fill_preserve(cr);
+                c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
+                c.cairo_set_line_width(cr, @floatFromInt(bw));
+                c.cairo_set_line_join(cr, c.CAIRO_LINE_JOIN_ROUND);
+                c.cairo_set_source_rgba(cr, 1, 1, 1, 0.95);
+                c.cairo_stroke(cr);
+            },
         }
 
         if (want.label) |l| {
+            var tbuf: [96]u8 = undefined;
+            const text = os.ov.labelText(&tbuf) orelse return;
             c.cairo_set_operator(cr, c.CAIRO_OPERATOR_OVER);
             roundedRect(cr, l, 4.0 * os.pxScale());
             c.cairo_set_source_rgba(cr, 0.08, 0.08, 0.10, 0.85);
             c.cairo_fill(cr);
 
-            var tbuf: [48]u8 = undefined;
-            const text = labelText(&tbuf, want.sel.?);
             setFont(cr, os.fontSize());
             var fe: c.cairo_font_extents_t = undefined;
             c.cairo_font_extents(cr, &fe);
@@ -471,7 +748,7 @@ const OutSurface = struct {
                 r.destroy();
             }
             os.configured = true;
-            os.dirty = true;
+            os.ov.relayout();
             os.render(); // first UI commit, before the parent maps
         }
         os.surface.?.commit();
@@ -515,6 +792,15 @@ fn layerListener(layer: *zwlr.LayerSurfaceV1, event: zwlr.LayerSurfaceV1.Event, 
     }
 }
 
+fn fractionalListener(_: *wp.FractionalScaleV1, event: wp.FractionalScaleV1.Event, os: *OutSurface) void {
+    switch (event) {
+        .preferred_scale => |p| {
+            os.exact_scale = @as(f64, @floatFromInt(p.scale)) / 120.0;
+            os.ov.relayout();
+        },
+    }
+}
+
 fn frameListener(cb: *wl.Callback, event: wl.Callback.Event, os: *OutSurface) void {
     switch (event) {
         .done => {
@@ -553,31 +839,58 @@ fn pointerListener(_: *wl.Pointer, event: wl.Pointer.Event, ov: *Overlay) void {
             const pressed = b.state == .pressed;
             if (b.button == btn_right and pressed) {
                 ov.state = .cancelled;
-            } else if (b.button == btn_left and pressed) {
-                const idx = ov.pointer_out orelse return;
-                const p = ov.pointerOn(idx) orelse return;
-                ov.sel.begin(idx, ov.outs[idx].bounds(), p);
-                ov.markAllDirty();
-            } else if (b.button == btn_left and !pressed and ov.sel.dragging) {
-                ov.sel.dragging = false;
-                if (ov.sel.rect() == null) {
-                    ov.sel.clear(); // a click without a drag selects nothing
-                    ov.markAllDirty();
-                } else if (!ov.opts.adjust) {
-                    ov.confirm();
-                }
+            } else if (b.button == btn_left) {
+                if (pressed) ov.onPress() else ov.onRelease();
             }
         },
         else => {},
     }
 }
 
+fn onPress(ov: *Overlay) void {
+    const p = ov.pointerCanvas() orelse return;
+    switch (ov.opts.mode) {
+        .region => ov.sel.begin(ov.layout.bounds, roundPt(p)),
+        .freeform => ov.lasso.begin(ov.gpa, ov.layout.bounds, p) catch return,
+        .window => return ov.clickWindow(),
+    }
+    ov.markAllDirty();
+}
+
+fn onRelease(ov: *Overlay) void {
+    switch (ov.opts.mode) {
+        .region => {
+            if (!ov.sel.dragging) return;
+            ov.sel.dragging = false;
+            if (ov.sel.rect() == null) {
+                ov.sel.clear(); // a click without a drag selects nothing
+                ov.markAllDirty();
+            } else if (!ov.opts.adjust) {
+                ov.confirmRegion();
+            }
+        },
+        .freeform => {
+            if (!ov.lasso.dragging) return;
+            ov.lasso.dragging = false;
+            ov.confirmLasso();
+        },
+        .window => {},
+    }
+}
+
 fn onPointerMoved(ov: *Overlay) void {
-    if (!ov.sel.dragging) return;
-    const idx = ov.sel.frame orelse return;
-    const p = ov.pointerOn(idx) orelse return;
-    ov.sel.update(p);
-    ov.outs[idx].dirty = true;
+    switch (ov.opts.mode) {
+        .region => if (ov.sel.dragging) {
+            const p = ov.pointerCanvas() orelse return;
+            ov.sel.update(roundPt(p));
+            ov.markAllDirty();
+        },
+        .freeform => if (ov.lasso.dragging) {
+            const p = ov.pointerCanvas() orelse return;
+            if (ov.lasso.add(ov.gpa, p) catch false) ov.markAllDirty();
+        },
+        .window => ov.updateHover(),
+    }
 }
 
 fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, ov: *Overlay) void {
@@ -641,9 +954,13 @@ fn onKey(ov: *Overlay, evdev: u32) void {
     const key = ov.classify(evdev);
     switch (key) {
         .escape => ov.state = .cancelled,
-        .enter => ov.confirm(),
+        .enter => switch (ov.opts.mode) {
+            .region => ov.confirmRegion(),
+            .window => ov.clickWindow(),
+            .freeform => {},
+        },
         .left, .right, .up, .down => {
-            if (ov.sel.dragging) return;
+            if (ov.opts.mode != .region or ov.sel.dragging) return;
             const d: [2]i32 = switch (key) {
                 .left => .{ -1, 0 },
                 .right => .{ 1, 0 },

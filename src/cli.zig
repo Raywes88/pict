@@ -18,6 +18,8 @@ pub const Options = struct {
     edit_path: ?[]const u8 = null,
     /// Keep the selection editable after mouse release; Enter confirms.
     adjust: bool = false,
+    /// `--fullscreen --all`: every output stitched into one image.
+    all_outputs: bool = false,
     timings: bool = false,
 };
 
@@ -43,12 +45,13 @@ pub const usage =
     \\
     \\Modes (default: --region):
     \\  --region            Drag a rectangle on a frozen screen
-    \\  --fullscreen        Capture the focused output
-    \\  --window            Capture a window              (Phase 2)
-    \\  --freeform          Lasso selection               (Phase 2)
+    \\  --fullscreen        Capture the focused output (--all: every output)
+    \\  --window            Hover a window, click to capture it (niri)
+    \\  --freeform          Draw a lasso; outside it is transparent
     \\  --edit <path>       Open an image in the editor   (Phase 3)
     \\
     \\Options:
+    \\  --all               With --fullscreen: all outputs in one image
     \\  --delay <seconds>   Wait before capturing
     \\  --cursor            Include the mouse cursor
     \\  --no-cursor         Exclude the mouse cursor (default)
@@ -61,7 +64,7 @@ pub const usage =
     \\  -V, --version       Show the version
     \\
     \\Keys in the overlay: Esc or right-click cancels. With --adjust, arrows move the
-    \\selection, Shift+arrows resize it, Enter confirms.
+    \\selection, Shift+arrows resize it, Enter confirms. Selections may span monitors.
     \\
     \\Exit status: 0 captured, 1 cancelled, 2 error.
     \\
@@ -107,6 +110,8 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
             no_copy = true;
         } else if (eq(a, "-o") or eq(a, "--output")) {
             o.output_path = try value(args, &i, diag);
+        } else if (eq(a, "--all")) {
+            o.all_outputs = true;
         } else if (eq(a, "--adjust")) {
             o.adjust = true;
         } else if (eq(a, "--timings")) {
@@ -119,6 +124,7 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
     if (o.edit_path != null and mode_set) return fail(diag, "--edit", "--edit cannot be combined with a capture mode", error.ConflictingFlags);
     if (copy_only and no_copy) return fail(diag, "--copy-only", "conflicts with --no-copy", error.ConflictingFlags);
     if (copy_only and o.output_path != null) return fail(diag, "--copy-only", "conflicts with --output", error.ConflictingFlags);
+    if (o.all_outputs and o.mode != .fullscreen) return fail(diag, "--all", "only applies to --fullscreen", error.ConflictingFlags);
     if (copy_only) o.save = false;
     if (no_copy) o.copy = false;
     return .{ .run = o };
@@ -177,6 +183,13 @@ test "rejects conflicting modes and bad values" {
     try std.testing.expectError(error.MissingValue, parse(&.{"--delay"}, &d));
     try std.testing.expectError(error.UnknownFlag, parse(&.{"--bogus"}, &d));
     try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--copy-only", "--no-copy" }, &d));
+}
+
+test "--all only with --fullscreen" {
+    const o = try parseOk(&.{ "--fullscreen", "--all" });
+    try std.testing.expect(o.all_outputs);
+    var d: Diag = .{};
+    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--region", "--all" }, &d));
 }
 
 test "serve-clipboard internal command" {
