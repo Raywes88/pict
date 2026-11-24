@@ -78,6 +78,60 @@ pub fn forceOpaque(self: *Image) void {
     self.is_opaque = true;
 }
 
+/// wl_output.transform values, in protocol order.
+pub const Transform = enum(u3) { normal, @"90", @"180", @"270", flipped, flipped_90, flipped_180, flipped_270 };
+
+/// Size of the upright image for a buffer captured from an output with transform `t`.
+pub fn uprightSize(w: u32, h: u32, t: Transform) [2]u32 {
+    return switch (t) {
+        .@"90", .@"270", .flipped_90, .flipped_270 => .{ h, w },
+        else => .{ w, h },
+    };
+}
+
+/// Fill `dst` (upright, size from `uprightSize`) from `src`, a frame in the output's
+/// hardware orientation. Per wl_surface.set_buffer_transform, the framebuffer holds the
+/// upright image already transformed by `t`, so dst(x, y) = src(t(x, y)).
+pub fn uprightFrom(dst: Image, src: Image, t: Transform) void {
+    const w: usize = dst.width;
+    const h: usize = dst.height;
+    for (0..h) |y| {
+        const out = dst.pixels[y * dst.stride ..][0 .. w * 4];
+        for (0..w) |x| {
+            const sx: usize, const sy: usize = switch (t) {
+                .normal => .{ x, y },
+                .@"90" => .{ y, w - 1 - x },
+                .@"180" => .{ w - 1 - x, h - 1 - y },
+                .@"270" => .{ h - 1 - y, x },
+                .flipped => .{ w - 1 - x, y },
+                .flipped_90 => .{ y, x },
+                .flipped_180 => .{ x, h - 1 - y },
+                .flipped_270 => .{ h - 1 - y, w - 1 - x },
+            };
+            @memcpy(out[x * 4 ..][0..4], src.pixels[sy * src.stride + sx * 4 ..][0..4]);
+        }
+    }
+}
+
+test "uprightFrom 90 and 270 are inverses with swapped sizes" {
+    const gpa = std.testing.allocator;
+    var src = try alloc(gpa, 3, 2); // hardware orientation
+    defer src.deinit(gpa);
+    for (0..6) |i| @memset(src.pixels[i * 4 ..][0..4], @intCast(i));
+    const sz = uprightSize(3, 2, .@"90");
+    try std.testing.expectEqual([2]u32{ 2, 3 }, sz);
+    var up = try alloc(gpa, sz[0], sz[1]);
+    defer up.deinit(gpa);
+    uprightFrom(up, src, .@"90");
+    // dst(0,0) = src(0, w-1-0) with w = 2 → src(0,1) = index 3
+    try std.testing.expectEqual(@as(u8, 3), up.pixels[0]);
+    // Rotating the upright image by the opposite transform restores the source.
+    var back = try alloc(gpa, 3, 2);
+    defer back.deinit(gpa);
+    uprightFrom(back, up, .@"270");
+    try std.testing.expectEqualSlices(u8, src.pixels, back.pixels);
+}
+
 test "crop copies the right pixels" {
     const gpa = std.testing.allocator;
     var img = try alloc(gpa, 4, 3);

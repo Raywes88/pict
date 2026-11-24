@@ -120,7 +120,9 @@ Done when `Mod+Shift+S { spawn "pict" "--region"; }` works.
 - **Deferred:**
   - `ext-image-copy-capture`: niri 26.04 doesn't offer it, so there is nothing here to test
     against.
-  - Output transforms (rotated monitors): needs a rotation test on a real output.
+- **Output transforms (rotated monitors):** done. niri's screencopy returns frames in hardware
+  orientation, so pict makes them upright at capture time. 90, 270 and flipped-90 on DP-3
+  match `grim` exactly. The other flipped variants use the same formulas but weren't tested.
 
 ### Phase 3
 

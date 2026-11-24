@@ -142,4 +142,15 @@ fn normalize(f: *Frame, gpa: Allocator) Error!void {
     var img = f.image();
     if (f.y_invert) img.flipVertical();
     img.forceOpaque();
+
+    // Screencopy returns rotated/flipped outputs in hardware orientation. Store the frame
+    // upright so the overlay, canvas and crops never deal with output transforms.
+    const raw = @backingInt(f.output.transform);
+    if (raw <= 0 or raw > 7) return;
+    const t: Image.Transform = @fromBackingInt(@intCast(raw));
+    const size = Image.uprightSize(img.width, img.height, t);
+    const up = shm.Buffer.create(gpa, f.client.shm.?, size[0], size[1], size[0] * 4, f.buffer.?.format) catch return error.OutOfMemory;
+    Image.uprightFrom(Image.view(up.data, size[0], size[1], size[0] * 4, true), img, t);
+    f.buffer.?.destroy(gpa);
+    f.buffer = up;
 }
