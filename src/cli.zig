@@ -14,8 +14,10 @@ pub const Options = struct {
     save: bool = true,
     /// Explicit output path; "-" means stdout. Null means the default directory and template.
     output_path: ?[]const u8 = null,
-    /// `--edit <path>`: open an existing image in the editor (Phase 3).
+    /// `--edit <path>`: open an existing image in the editor.
     edit_path: ?[]const u8 = null,
+    /// Open the annotation editor after capturing.
+    editor: bool = true,
     /// Keep the selection editable after mouse release; Enter confirms.
     adjust: bool = false,
     /// `--fullscreen --all`: every output stitched into one image.
@@ -48,15 +50,16 @@ pub const usage =
     \\  --fullscreen        Capture the focused output (--all: every output)
     \\  --window            Hover a window, click to capture it (niri)
     \\  --freeform          Draw a lasso; outside it is transparent
-    \\  --edit <path>       Open an image in the editor   (Phase 3)
+    \\  --edit <path>       Open an image (PNG, JPEG, WebP) in the editor
     \\
     \\Options:
     \\  --all               With --fullscreen: all outputs in one image
     \\  --delay <seconds>   Wait before capturing
     \\  --cursor            Include the mouse cursor
     \\  --no-cursor         Exclude the mouse cursor (default)
-    \\  --copy-only         Copy to the clipboard, don't save a file
+    \\  --copy-only         Copy to the clipboard; no file, no editor
     \\  --no-copy           Save a file, don't touch the clipboard
+    \\  --no-edit           Save and copy, but don't open the editor
     \\  -o, --output <path> Save to <path> ("-" writes PNG to stdout)
     \\  --adjust            Keep the selection editable after release; Enter confirms
     \\  --timings           Print stage timings to stderr
@@ -65,6 +68,14 @@ pub const usage =
     \\
     \\Keys in the overlay: Esc or right-click cancels. With --adjust, arrows move the
     \\selection, Shift+arrows resize it, Enter confirms. Selections may span monitors.
+    \\
+    \\After a capture the editor opens (unless --copy-only, --no-edit or -o -). The snip
+    \\is saved and copied first; every edit is re-copied to the clipboard. Editor keys:
+    \\  P pen  H highlighter  E eraser  L line  A arrow  R rectangle  O ellipse  T text
+    \\  B blur  X pixelate  C crop  I pick colour  1-8 colours  [ ] size
+    \\  Ctrl+Z / Ctrl+Shift+Z undo/redo   Ctrl+C copy   Ctrl+S save   Ctrl+Shift+S save as
+    \\  Ctrl+scroll zoom   Ctrl+0 fit   Ctrl+1 100%   scroll, middle-drag, Space+drag pan
+    \\  Esc closes (twice with unsaved changes)
     \\
     \\Exit status: 0 captured, 1 cancelled, 2 error.
     \\
@@ -108,6 +119,8 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
             copy_only = true;
         } else if (eq(a, "--no-copy")) {
             no_copy = true;
+        } else if (eq(a, "--no-edit")) {
+            o.editor = false;
         } else if (eq(a, "-o") or eq(a, "--output")) {
             o.output_path = try value(args, &i, diag);
         } else if (eq(a, "--all")) {
@@ -125,7 +138,13 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
     if (copy_only and no_copy) return fail(diag, "--copy-only", "conflicts with --no-copy", error.ConflictingFlags);
     if (copy_only and o.output_path != null) return fail(diag, "--copy-only", "conflicts with --output", error.ConflictingFlags);
     if (o.all_outputs and o.mode != .fullscreen) return fail(diag, "--all", "only applies to --fullscreen", error.ConflictingFlags);
-    if (copy_only) o.save = false;
+    if (copy_only) {
+        o.save = false;
+        o.editor = false;
+    }
+    if (o.output_path) |p| if (std.mem.eql(u8, p, "-")) {
+        o.editor = false;
+    };
     if (no_copy) o.copy = false;
     return .{ .run = o };
 }
@@ -163,16 +182,18 @@ fn parseOk(args: []const []const u8) !Options {
     };
 }
 
-test "defaults to region, save and copy" {
+test "defaults to region, save, copy and edit" {
     const o = try parseOk(&.{});
     try std.testing.expectEqual(Mode.region, o.mode);
-    try std.testing.expect(o.save and o.copy and !o.cursor);
+    try std.testing.expect(o.save and o.copy and !o.cursor and o.editor);
+    try std.testing.expect(!(try parseOk(&.{ "-o", "-" })).editor);
+    try std.testing.expect(!(try parseOk(&.{"--no-edit"})).editor);
 }
 
-test "copy-only disables save" {
+test "copy-only disables save and the editor" {
     const o = try parseOk(&.{ "--fullscreen", "--copy-only", "--cursor", "--delay", "3" });
     try std.testing.expectEqual(Mode.fullscreen, o.mode);
-    try std.testing.expect(!o.save and o.copy and o.cursor);
+    try std.testing.expect(!o.save and o.copy and o.cursor and !o.editor);
     try std.testing.expectEqual(@as(u32, 3), o.delay_s);
 }
 

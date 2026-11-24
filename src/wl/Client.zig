@@ -9,6 +9,7 @@ const wl = wayland.client.wl;
 const wp = wayland.client.wp;
 const zxdg = wayland.client.zxdg;
 const zwlr = wayland.client.zwlr;
+const xdg = wayland.client.xdg;
 
 gpa: Allocator,
 display: *wl.Display,
@@ -25,6 +26,7 @@ screencopy: ?*zwlr.ScreencopyManagerV1 = null,
 viewporter: ?*wp.Viewporter = null,
 cursor_shape: ?*wp.CursorShapeManagerV1 = null,
 fractional_scale: ?*wp.FractionalScaleManagerV1 = null,
+wm_base: ?*xdg.WmBase = null,
 
 outputs: std.ArrayList(*Output) = .empty,
 
@@ -80,6 +82,7 @@ pub fn connect(gpa: Allocator) !*Client {
 pub fn deinit(self: *Client) void {
     for (self.outputs.items) |o| o.deinit(self.gpa);
     self.outputs.deinit(self.gpa);
+    if (self.wm_base) |g| g.destroy();
     if (self.fractional_scale) |g| g.destroy();
     if (self.cursor_shape) |g| g.destroy();
     if (self.viewporter) |g| g.destroy();
@@ -146,6 +149,10 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Cli
                 self.cursor_shape = registry.bind(g.name, wp.CursorShapeManagerV1, g.version) catch null;
             } else if (is(iface, wp.FractionalScaleManagerV1)) {
                 self.fractional_scale = registry.bind(g.name, wp.FractionalScaleManagerV1, g.version) catch null;
+            } else if (is(iface, xdg.WmBase)) {
+                const wm = registry.bind(g.name, xdg.WmBase, g.version) catch return;
+                self.wm_base = wm;
+                wm.setListener(?*anyopaque, wmBaseListener, null);
             } else if (is(iface, wl.Output)) {
                 const wl_output = registry.bind(g.name, wl.Output, g.version) catch return;
                 const o = self.gpa.create(Output) catch {
@@ -171,6 +178,12 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, self: *Cli
                 }
             }
         },
+    }
+}
+
+fn wmBaseListener(wm: *xdg.WmBase, event: xdg.WmBase.Event, _: ?*anyopaque) void {
+    switch (event) {
+        .ping => |p| wm.pong(p.serial),
     }
 }
 

@@ -52,7 +52,8 @@ src/overlay/                  Overlay.zig (layer surfaces, render, input), selec
 src/clipboard.zig             re-exec'd data-control owner, wl-copy fallback
 src/niri.zig                  $NIRI_SOCKET JSON IPC
 src/save.zig                  default dir, strftime template, collision-safe names
-src/editor/                   Phase 3
+src/editor/                   Phase 3: Editor, doc, render, effects, toolbar, icons, autocopy, portal
+src/image/codec.zig           JPEG and WebP, format sniffing
 ```
 
 Data flow: `capture` returns `[]Frame`, `overlay` returns a `Selection` in physical px,
@@ -128,12 +129,44 @@ Done when `Mod+Shift+S { spawn "pict" "--region"; }` works.
 
 Editor: xdg_toplevel with a Cairo canvas.
 
-- Annotations stay vector until export. The undo/redo command stack stores region snapshots for
-  raster operations.
+- Annotations stay vector until export. Undo/redo only flips visibility or swaps a crop rect,
+  so there are no pixel snapshots.
 - Tools: pen, highlighter, eraser (removes whole objects), line, arrow, rectangle, ellipse, text,
   blur and pixelate.
 - Non-destructive crop, color picker, zoom and pan (only the visible region is rendered).
 - `--edit`. Save As via the xdg-desktop-portal FileChooser.
+
+**Decisions (Wes, 2026-11-24):** open floating with the fixed-size trick (no niri rule), Pango
+for text, re-copy to the clipboard after every edit (like Windows), Save As through the desktop's
+standard dialog.
+
+**Status (2026-11-24):** built and verified with `PICT_TEST_EDITOR` scripts on kotov.
+- **Modules:** `editor/doc.zig` (objects, crop, undo; pure, tested), `effects.zig` (box blur,
+  pixelate), `render.zig` (Cairo + Pango, shared by the view and export), `toolbar.zig` +
+  `icons.zig`, `autocopy.zig`, `portal.zig` (sd-bus FileChooser), `Editor.zig` (window, loop,
+  input). `image/codec.zig` adds JPEG (TurboJPEG, 4:4:4) and lossless WebP, encode and decode.
+- **Rendering:** the base image and committed annotations go into a scene cache keyed on
+  (doc revision, zoom, pan, size, crop mode). Each frame copies the scene, repaints the toolbar,
+  and draws the live layer (stroke in progress, crop frame, brush ring, tooltip, toast). Damage
+  covers the toolbar only when it changed plus the live layer's old and new bounds.
+- **Floating:** niri floats windows whose min and max height match on the first commit. pict
+  sets both to its preferred size, then clears them after the first frame. Verified: niri
+  reports `is_floating: true` and the window resizes freely afterwards.
+- **Auto-copy:** a change schedules a copy 250 ms later (deferred while a stroke or text box is
+  open). The image is flattened on the main thread and PNG-encoded on a worker thread, then
+  handed to a new `__serve-clipboard` process; the old one exits on `cancelled`. Pending changes
+  are flushed at exit. Verified: the clipboard held the mid-edit state during the session and
+  matched the final saved file exactly after closing. Each copy is a new cliphist entry.
+- **Blur:** edge-clamped inside the box (sampling outside made the box fade at its edges).
+  Blur and pixelate read the base image, not annotations under them.
+- **Verified:** shapes, smoothed pen, multiply highlighter, text add and re-edit, eraser hover
+  and erase, undo/redo, crop handles, 200% zoom with nearest-neighbour pixels, the colour
+  popover, tooltips, the unsaved-changes close confirmation, and the portal dialog (Nautilus
+  opens floating; closing it returns `cancelled`). At scale 1.5 a 1300×600 window renders a
+  1950×900 buffer and 100% is exact. Launch to first frame to exit takes under 100 ms
+  (ReleaseFast).
+- **Not yet tested by hand:** real mouse drawing feel, key repeat, choosing a file in the Save
+  As dialog, and pasting an edited snip into another app.
 
 ### Phase 4
 

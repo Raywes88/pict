@@ -1,6 +1,11 @@
 // C headers translated by `b.addTranslateC` (Zig 0.17 has no @cImport).
 #define _GNU_SOURCE
 #include <cairo/cairo.h>
+#include <pango/pangocairo.h>
+#include <systemd/sd-bus.h>
+#include <turbojpeg.h>
+#include <webp/decode.h>
+#include <webp/encode.h>
 #include <png.h>
 #include <xkbcommon/xkbcommon.h>
 

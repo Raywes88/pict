@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     scanner.generate("wl_shm", 1);
     scanner.generate("wl_seat", 8);
     scanner.generate("wl_output", 4);
-    scanner.generate("xdg_wm_base", 2);
+    scanner.generate("xdg_wm_base", 6);
     scanner.generate("zxdg_output_manager_v1", 3);
     scanner.generate("wp_viewporter", 1);
     scanner.generate("wp_fractional_scale_manager_v1", 1);
@@ -42,7 +42,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const c_libs = [_][]const u8{ "cairo", "libpng", "xkbcommon" };
+    const c_libs = [_][]const u8{ "cairo", "pangocairo", "libpng", "libturbojpeg", "libwebp", "libsystemd", "xkbcommon" };
     for (c_libs) |lib| translate_c.linkSystemLibrary(lib, .{});
     const c_mod = translate_c.createModule();
 

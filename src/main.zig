@@ -14,6 +14,8 @@ const Overlay = @import("overlay/Overlay.zig");
 const layout_mod = @import("layout.zig");
 const Layout = layout_mod.Layout;
 const compose = @import("compose.zig").compose;
+const codec = @import("image/codec.zig");
+const Editor = @import("editor/Editor.zig");
 
 pub const version = "0.1.0";
 
@@ -47,7 +49,7 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
     const io = init.io;
     const gpa = init.gpa;
 
-    if (o.edit_path != null) return error.EditorNotImplemented;
+    if (o.edit_path) |p| return editFile(init, o, p);
 
     var t = Timings.init(io, o.timings);
     if (o.delay_s > 0) try io.sleep(.fromSeconds(o.delay_s), .awake);
@@ -59,6 +61,8 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
     t.mark("connect");
 
     var result: Image = undefined;
+    // Buffer px per logical px of the capture, so the editor's 100% is 1:1.
+    var image_scale: f64 = 1;
     switch (o.mode) {
         .fullscreen => if (o.all_outputs) {
             const frames = try screencopy.capture(client, client.outputs.items, o.cursor);
@@ -68,12 +72,14 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
             const images = try imagesOf(gpa, frames);
             defer gpa.free(images);
             result = try compose(gpa, &layout, images, layout.bounds, null);
+            image_scale = layout.scale;
         } else {
             const target = focusedOutput(ipc, client);
             const frames = try screencopy.capture(client, &.{target}, o.cursor);
             defer screencopy.freeFrames(gpa, frames);
             t.mark("capture");
             result = try frames[0].image().crop(gpa, frames[0].image().bounds());
+            image_scale = layoutOf(frames).scale;
         },
         .region, .freeform, .window => {
             const frames = try screencopy.capture(client, client.outputs.items, o.cursor);
@@ -104,6 +110,7 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
             t.mark("select");
             const images = try imagesOf(gpa, frames);
             defer gpa.free(images);
+            image_scale = sel.layout.scale;
             result = switch (sel.result) {
                 .rect => |r| try compose(gpa, &sel.layout, images, r, null),
                 .lasso => |l| blk: {
@@ -120,20 +127,20 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
     defer gpa.free(bytes);
     t.mark("encode");
 
+    var saved_path: ?[]u8 = null;
+    defer if (saved_path) |sp| gpa.free(sp);
     if (o.save) {
         if (o.output_path) |p| {
             if (std.mem.eql(u8, p, "-")) {
                 try Io.File.stdout().writeStreamingAll(io, bytes);
             } else {
-                const path = try save.saveTo(io, gpa, p, bytes);
-                defer gpa.free(path);
-                try printStdout(io, "{s}\n", .{path});
+                saved_path = try save.saveTo(io, gpa, p, bytes);
+                try printStdout(io, "{s}\n", .{saved_path.?});
             }
         } else {
             const home = init.environ_map.get("HOME") orelse return error.NoHome;
-            const path = try save.saveDefault(io, gpa, home, bytes, "png");
-            defer gpa.free(path);
-            try printStdout(io, "{s}\n", .{path});
+            saved_path = try save.saveDefault(io, gpa, home, bytes, "png");
+            try printStdout(io, "{s}\n", .{saved_path.?});
         }
         t.mark("save");
     }
@@ -144,6 +151,48 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
     }
 
     t.report(result.width, result.height, bytes.len);
+
+    if (o.editor) {
+        try Editor.run(client, &result, editorOptions(init, o, ipc, client, saved_path, image_scale));
+    }
+    return @backingInt(Outcome.captured);
+}
+
+fn editorOptions(init: std.process.Init, o: cli.Options, ipc: ?niri.Ipc, client: *Client, path: ?[]const u8, image_scale: f64) Editor.Options {
+    const out = focusedOutput(ipc, client);
+    const lw: f64 = @floatFromInt(if (out.logical_w > 0) out.logical_w else 1920);
+    const lh: f64 = @floatFromInt(if (out.logical_h > 0) out.logical_h else 1080);
+    return .{
+        .io = init.io,
+        .path = path,
+        .home = init.environ_map.get("HOME"),
+        .image_scale = image_scale,
+        .max_size = .{ lw * 0.9, lh * 0.9 },
+        .auto_copy = o.copy,
+        .keep_stderr = init.environ_map.get("PICT_DEBUG") != null,
+        .test_script = init.environ_map.get("PICT_TEST_EDITOR"),
+    };
+}
+
+/// `pict --edit <path>`: open an existing image.
+fn editFile(init: std.process.Init, o: cli.Options, path: []const u8) !u8 {
+    const io = init.io;
+    const gpa = init.gpa;
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(512 * 1024 * 1024)) catch return error.CannotReadImage;
+    defer gpa.free(bytes);
+    var img = try codec.decode(gpa, bytes);
+    defer img.deinit(gpa);
+
+    const client = try Client.connect(gpa);
+    defer client.deinit();
+    const ipc = niri.Ipc.fromEnv(io, gpa, init.environ_map);
+    // A file has no capture scale; assume the focused output's, so 100% is 1:1 there.
+    const out = focusedOutput(ipc, client);
+    const scale: f64 = if (out.logical_w > 0 and out.mode_w > 0)
+        @as(f64, @floatFromInt(@max(out.mode_w, out.mode_h))) / @as(f64, @floatFromInt(@max(out.logical_w, out.logical_h)))
+    else
+        1;
+    try Editor.run(client, &img, editorOptions(init, o, ipc, client, path, scale));
     return @backingInt(Outcome.captured);
 }
 
@@ -253,7 +302,9 @@ fn describe(err: anyerror) []const u8 {
         error.NoHome => "HOME is not set",
         error.WindowModeNeedsNiri => "--window needs niri ($NIRI_SOCKET is not set)",
         error.NiriScreenshotTimeout => "niri did not produce the window screenshot in time",
-        error.EditorNotImplemented => "--edit arrives in Phase 3 (the editor)",
+        error.CannotReadImage => "cannot read the image file",
+        error.UnknownImageFormat => "not a PNG, JPEG or WebP image",
+        error.NoXdgShell => "compositor offers no xdg_wm_base; the editor needs it",
         error.WlCopyFailed => "clipboard: no data-control protocol and wl-copy failed",
         else => @errorName(err),
     };
@@ -314,4 +365,12 @@ test {
     _ = @import("overlay/selection.zig");
     _ = layout_mod;
     _ = @import("compose.zig");
+    _ = @import("editor/doc.zig");
+    _ = @import("editor/effects.zig");
+    _ = @import("image/codec.zig");
+    _ = @import("editor/render.zig");
+    _ = @import("editor/icons.zig");
+    _ = @import("editor/toolbar.zig");
+    _ = @import("editor/portal.zig");
+    _ = @import("editor/autocopy.zig");
 }
