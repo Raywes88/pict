@@ -1,6 +1,7 @@
 //! Command-line parsing. Pure (no I/O) so it can be unit-tested.
 
 const std = @import("std");
+const Format = @import("image/codec.zig").Format;
 
 pub const Mode = enum { region, window, fullscreen, freeform };
 
@@ -22,15 +23,23 @@ pub const Options = struct {
     adjust: bool = false,
     /// `--fullscreen --all`: every output stitched into one image.
     all_outputs: bool = false,
+    /// `--ocr`: recognise the text in the capture and copy that instead of the image.
+    ocr: bool = false,
+    /// Format for saved files (the clipboard always gets PNG). `-o` with a known
+    /// extension overrides it.
+    format: Format = .png,
+    jpeg_quality: u8 = 92,
     timings: bool = false,
 };
 
-pub const ServeArgs = struct { data_fd: i32, ready_fd: i32 };
+pub const ServeArgs = struct { data_fd: i32, ready_fd: i32, text: bool = false };
 
 pub const Action = union(enum) {
     run: Options,
     help,
     version,
+    print_config,
+    print_niri_binds,
     /// Internal: the forked clipboard owner (`pict __serve-clipboard <data_fd> <ready_fd>`).
     serve_clipboard: ServeArgs,
 };
@@ -51,6 +60,7 @@ pub const usage =
     \\  --window            Hover a window, click to capture it (niri)
     \\  --freeform          Draw a lasso; outside it is transparent
     \\  --edit <path>       Open an image (PNG, JPEG, WebP) in the editor
+    \\  --ocr               Select an area, copy its text (no image, no editor)
     \\
     \\Options:
     \\  --all               With --fullscreen: all outputs in one image
@@ -61,8 +71,11 @@ pub const usage =
     \\  --no-copy           Save a file, don't touch the clipboard
     \\  --no-edit           Save and copy, but don't open the editor
     \\  -o, --output <path> Save to <path> ("-" writes PNG to stdout)
+    \\  --format <fmt>      Save as png, jpg or webp (default from the config)
     \\  --adjust            Keep the selection editable after release; Enter confirms
     \\  --timings           Print stage timings to stderr
+    \\  --print-config      Print a documented default config.toml
+    \\  --print-niri-binds  Print a niri binds {} block for pict
     \\  -h, --help          Show this help
     \\  -V, --version       Show the version
     \\
@@ -73,25 +86,30 @@ pub const usage =
     \\is saved and copied first; every edit is re-copied to the clipboard. Editor keys:
     \\  P pen  H highlighter  E eraser  L line  A arrow  R rectangle  O ellipse  T text
     \\  B blur  X pixelate  C crop  I pick colour  1-8 colours  [ ] size
-    \\  Ctrl+Z / Ctrl+Shift+Z undo/redo   Ctrl+C copy   Ctrl+S save   Ctrl+Shift+S save as
+    \\  Ctrl+Z / Ctrl+Shift+Z undo/redo   Ctrl+C copy   Ctrl+Shift+C copy text (OCR)
+    \\  Ctrl+S save   Ctrl+Shift+S save as
     \\  Ctrl+scroll zoom   Ctrl+0 fit   Ctrl+1 100%   scroll, middle-drag, Space+drag pan
     \\  Esc closes (twice with unsaved changes)
+    \\
+    \\Defaults come from ~/.config/pict/config.toml (see --print-config); flags win.
     \\
     \\Exit status: 0 captured, 1 cancelled, 2 error.
     \\
 ;
 
-pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
-    var o: Options = .{};
+/// Parse `args` over `base` (the config file's defaults).
+pub fn parse(args: []const []const u8, base: Options, diag: *Diag) Error!Action {
+    var o = base;
     var mode_set = false;
     var copy_only = false;
     var no_copy = false;
 
     if (args.len >= 1 and std.mem.eql(u8, args[0], "__serve-clipboard")) {
-        if (args.len != 3) return fail(diag, args[0], "expects <data_fd> <ready_fd>", error.MissingValue);
+        if (args.len != 3 and args.len != 4) return fail(diag, args[0], "expects <data_fd> <ready_fd> [png|text]", error.MissingValue);
         const data_fd = std.fmt.parseInt(i32, args[1], 10) catch return fail(diag, args[1], "not an fd", error.InvalidValue);
         const ready_fd = std.fmt.parseInt(i32, args[2], 10) catch return fail(diag, args[2], "not an fd", error.InvalidValue);
-        return .{ .serve_clipboard = .{ .data_fd = data_fd, .ready_fd = ready_fd } };
+        const text = args.len == 4 and std.mem.eql(u8, args[3], "text");
+        return .{ .serve_clipboard = .{ .data_fd = data_fd, .ready_fd = ready_fd, .text = text } };
     }
 
     var i: usize = 0;
@@ -99,6 +117,8 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
         const a = args[i];
         if (eq(a, "-h") or eq(a, "--help")) return .help;
         if (eq(a, "-V") or eq(a, "--version")) return .version;
+        if (eq(a, "--print-config")) return .print_config;
+        if (eq(a, "--print-niri-binds")) return .print_niri_binds;
 
         if (modeFlag(a)) |m| {
             if (mode_set and o.mode != m) return fail(diag, a, "only one mode may be given", error.ConflictingFlags);
@@ -123,6 +143,11 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
             o.editor = false;
         } else if (eq(a, "-o") or eq(a, "--output")) {
             o.output_path = try value(args, &i, diag);
+        } else if (eq(a, "--ocr")) {
+            o.ocr = true;
+        } else if (eq(a, "--format")) {
+            const v = try value(args, &i, diag);
+            o.format = Format.fromName(v) orelse return fail(diag, v, "format must be png, jpg or webp", error.InvalidValue);
         } else if (eq(a, "--all")) {
             o.all_outputs = true;
         } else if (eq(a, "--adjust")) {
@@ -138,6 +163,12 @@ pub fn parse(args: []const []const u8, diag: *Diag) Error!Action {
     if (copy_only and no_copy) return fail(diag, "--copy-only", "conflicts with --no-copy", error.ConflictingFlags);
     if (copy_only and o.output_path != null) return fail(diag, "--copy-only", "conflicts with --output", error.ConflictingFlags);
     if (o.all_outputs and o.mode != .fullscreen) return fail(diag, "--all", "only applies to --fullscreen", error.ConflictingFlags);
+    if (o.ocr and o.edit_path != null) return fail(diag, "--ocr", "conflicts with --edit (the editor has Ctrl+Shift+C)", error.ConflictingFlags);
+    if (o.ocr and o.output_path != null) return fail(diag, "--ocr", "conflicts with --output", error.ConflictingFlags);
+    if (o.ocr) {
+        o.save = false;
+        o.editor = false;
+    }
     if (copy_only) {
         o.save = false;
         o.editor = false;
@@ -176,7 +207,7 @@ fn eq(a: []const u8, b: []const u8) bool {
 
 fn parseOk(args: []const []const u8) !Options {
     var d: Diag = .{};
-    return switch (try parse(args, &d)) {
+    return switch (try parse(args, .{}, &d)) {
         .run => |o| o,
         else => error.TestUnexpectedResult,
     };
@@ -199,23 +230,44 @@ test "copy-only disables save and the editor" {
 
 test "rejects conflicting modes and bad values" {
     var d: Diag = .{};
-    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--region", "--window" }, &d));
-    try std.testing.expectError(error.InvalidValue, parse(&.{ "--delay", "abc" }, &d));
-    try std.testing.expectError(error.MissingValue, parse(&.{"--delay"}, &d));
-    try std.testing.expectError(error.UnknownFlag, parse(&.{"--bogus"}, &d));
-    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--copy-only", "--no-copy" }, &d));
+    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--region", "--window" }, .{}, &d));
+    try std.testing.expectError(error.InvalidValue, parse(&.{ "--delay", "abc" }, .{}, &d));
+    try std.testing.expectError(error.MissingValue, parse(&.{"--delay"}, .{}, &d));
+    try std.testing.expectError(error.UnknownFlag, parse(&.{"--bogus"}, .{}, &d));
+    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--copy-only", "--no-copy" }, .{}, &d));
 }
 
 test "--all only with --fullscreen" {
     const o = try parseOk(&.{ "--fullscreen", "--all" });
     try std.testing.expect(o.all_outputs);
     var d: Diag = .{};
-    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--region", "--all" }, &d));
+    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--region", "--all" }, .{}, &d));
+}
+
+test "config defaults apply and flags override them" {
+    var d: Diag = .{};
+    const base: Options = .{ .mode = .window, .editor = false, .cursor = true, .format = .webp };
+    const a = (try parse(&.{}, base, &d)).run;
+    try std.testing.expectEqual(Mode.window, a.mode);
+    try std.testing.expect(!a.editor and a.cursor);
+    const b = (try parse(&.{ "--region", "--no-cursor", "--format", "jpg" }, base, &d)).run;
+    try std.testing.expectEqual(Mode.region, b.mode);
+    try std.testing.expect(!b.cursor);
+    try std.testing.expectEqual(Format.jpeg, b.format);
+    // A config mode doesn't conflict with --edit.
+    _ = (try parse(&.{ "--edit", "x.png" }, base, &d)).run;
+}
+
+test "--ocr implies no file and no editor" {
+    const o = try parseOk(&.{ "--ocr", "--freeform" });
+    try std.testing.expect(o.ocr and !o.save and !o.editor and o.copy);
+    var d: Diag = .{};
+    try std.testing.expectError(error.ConflictingFlags, parse(&.{ "--ocr", "-o", "x.png" }, .{}, &d));
 }
 
 test "serve-clipboard internal command" {
     var d: Diag = .{};
-    const a = try parse(&.{ "__serve-clipboard", "5", "7" }, &d);
+    const a = try parse(&.{ "__serve-clipboard", "5", "7" }, .{}, &d);
     try std.testing.expectEqual(@as(i32, 5), a.serve_clipboard.data_fd);
     try std.testing.expectEqual(@as(i32, 7), a.serve_clipboard.ready_fd);
 }

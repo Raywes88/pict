@@ -2,10 +2,10 @@
 //!
 //! Wayland clipboard data is served on demand by its owner, so the owner has to stay
 //! alive after pict exits. `copyPng` double-forks and re-execs pict as
-//! `pict __serve-clipboard <data_fd> <ready_fd>`. That process takes the selection with
-//! ext-data-control (falling back to wlr-data-control), signals readiness over a pipe,
-//! serves `image/png` until someone else takes the clipboard, then exits. No daemon.
-//! If neither protocol is available, falls back to `wl-copy`.
+//! `pict __serve-clipboard <data_fd> <ready_fd> <png|text>`. That process takes the
+//! selection with ext-data-control (falling back to wlr-data-control), signals readiness
+//! over a pipe, serves the data until someone else takes the clipboard, then exits. No
+//! daemon. If neither protocol is available, falls back to `wl-copy`.
 
 const std = @import("std");
 const posix = std.posix;
@@ -16,20 +16,39 @@ const wl = wayland.client.wl;
 const ext = wayland.client.ext;
 const zwlr = wayland.client.zwlr;
 
-pub const mime = "image/png";
+pub const Kind = enum {
+    png,
+    text,
+
+    /// MIME types offered, preferred first.
+    fn mimes(k: Kind) []const [:0]const u8 {
+        return switch (k) {
+            .png => &.{"image/png"},
+            .text => &.{ "text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT" },
+        };
+    }
+};
 
 pub fn copyPng(bytes: []const u8, keep_stderr: bool) !void {
+    return copy(bytes, .png, keep_stderr);
+}
+
+pub fn copyText(text: []const u8, keep_stderr: bool) !void {
+    return copy(text, .text, keep_stderr);
+}
+
+pub fn copy(bytes: []const u8, kind: Kind, keep_stderr: bool) !void {
     const data_fd = try posix.memfd_create("pict-clipboard", 0); // inherited across exec
     defer _ = c.close(data_fd);
     try writeAll(data_fd, bytes);
 
-    if (spawnServer(data_fd, keep_stderr)) return else |err| {
+    if (spawnServer(data_fd, kind, keep_stderr)) return else |err| {
         std.log.debug("clipboard server unavailable ({t}); falling back to wl-copy", .{err});
     }
-    try wlCopy(data_fd);
+    try wlCopy(data_fd, kind);
 }
 
-fn spawnServer(data_fd: c_int, keep_stderr: bool) !void {
+fn spawnServer(data_fd: c_int, kind: Kind, keep_stderr: bool) !void {
     var pipe_fds: [2]c_int = undefined;
     if (c.pipe2(&pipe_fds, c.O_CLOEXEC) != 0) return error.PipeFailed;
     const ready_r = pipe_fds[0];
@@ -41,7 +60,7 @@ fn spawnServer(data_fd: c_int, keep_stderr: bool) !void {
     var ready_buf: [16]u8 = undefined;
     const data_arg = try std.fmt.bufPrintSentinel(&data_buf, "{d}", .{data_fd}, 0);
     const ready_arg = try std.fmt.bufPrintSentinel(&ready_buf, "{d}", .{ready_w}, 0);
-    const argv = [_:null]?[*:0]const u8{ "pict", "__serve-clipboard", data_arg.ptr, ready_arg.ptr };
+    const argv = [_:null]?[*:0]const u8{ "pict", "__serve-clipboard", data_arg.ptr, ready_arg.ptr, @tagName(kind) };
 
     const pid = c.fork();
     if (pid < 0) {
@@ -72,9 +91,9 @@ fn spawnServer(data_fd: c_int, keep_stderr: bool) !void {
     if (got != 1 or b[0] != 'k') return error.ServerNotReady;
 }
 
-fn wlCopy(data_fd: c_int) !void {
+fn wlCopy(data_fd: c_int, kind: Kind) !void {
     if (c.lseek(data_fd, 0, c.SEEK_SET) != 0) return error.SeekFailed;
-    const argv = [_:null]?[*:0]const u8{ "wl-copy", "--type", mime };
+    const argv = [_:null]?[*:0]const u8{ "wl-copy", "--type", kind.mimes()[0] };
     const pid = c.fork();
     if (pid < 0) return error.ForkFailed;
     if (pid == 0) {
@@ -124,7 +143,7 @@ const Globals = struct {
 };
 
 /// Entry point for `pict __serve-clipboard`. Returns the process exit code.
-pub fn serve(data_fd: i32, ready_fd: i32) u8 {
+pub fn serve(data_fd: i32, ready_fd: i32, kind: Kind) u8 {
     _ = c.signal(c.SIGPIPE, sigIgn());
 
     const size_off = c.lseek(data_fd, 0, c.SEEK_END);
@@ -141,8 +160,8 @@ pub fn serve(data_fd: i32, ready_fd: i32) u8 {
     if (display.roundtrip() != .SUCCESS) return 2;
     const seat = g.seat orelse return 2;
 
-    if (g.ext_mgr) |m| return run(ext, m, seat, display, data, ready_fd);
-    if (g.wlr_mgr) |m| return run(zwlr, m, seat, display, data, ready_fd);
+    if (g.ext_mgr) |m| return run(ext, m, seat, display, data, ready_fd, kind);
+    if (g.wlr_mgr) |m| return run(zwlr, m, seat, display, data, ready_fd, kind);
     return 3; // parent falls back to wl-copy
 }
 
@@ -169,12 +188,17 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, g: *Global
 fn ServeState(comptime ns: type) type {
     return struct {
         data: []const u8,
+        kind: Kind,
         done: bool = false,
 
         fn sourceListener(_: *ns.DataControlSourceV1, event: ns.DataControlSourceV1.Event, s: *@This()) void {
             switch (event) {
                 .send => |req| {
-                    if (std.mem.eql(u8, std.mem.span(req.mime_type), mime)) writeAll(req.fd, s.data) catch {};
+                    const want = std.mem.span(req.mime_type);
+                    for (s.kind.mimes()) |m| if (std.mem.eql(u8, want, m)) {
+                        writeAll(req.fd, s.data) catch {};
+                        break;
+                    };
                     _ = c.close(req.fd);
                 },
                 .cancelled => s.done = true,
@@ -191,13 +215,13 @@ fn ServeState(comptime ns: type) type {
     };
 }
 
-fn run(comptime ns: type, mgr: *ns.DataControlManagerV1, seat: *wl.Seat, display: *wl.Display, data: []const u8, ready_fd: i32) u8 {
+fn run(comptime ns: type, mgr: *ns.DataControlManagerV1, seat: *wl.Seat, display: *wl.Display, data: []const u8, ready_fd: i32, kind: Kind) u8 {
     const State = ServeState(ns);
-    var state: State = .{ .data = data };
+    var state: State = .{ .data = data, .kind = kind };
 
     const source = mgr.createDataSource() catch return 2;
     source.setListener(*State, State.sourceListener, &state);
-    source.offer(mime);
+    for (kind.mimes()) |m| source.offer(m.ptr);
     const device = mgr.getDataDevice(seat) catch return 2;
     device.setListener(*State, State.deviceListener, &state);
     device.setSelection(source);

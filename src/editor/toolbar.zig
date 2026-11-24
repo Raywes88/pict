@@ -9,7 +9,7 @@ const Color = @import("doc.zig").Color;
 
 pub const Tool = enum { pen, highlighter, eraser, line, arrow, rect, ellipse, text, blur, pixelate, crop, picker };
 
-pub const palette = [8]Color{
+pub const default_palette = [8]Color{
     .{ .r = 0.898, .g = 0.224, .b = 0.208 }, // red
     .{ .r = 0.984, .g = 0.549, .b = 0.0 }, // orange
     .{ .r = 0.992, .g = 0.847, .b = 0.208 }, // yellow
@@ -31,6 +31,7 @@ pub const Item = union(enum) {
     redo,
     zoom,
     copy,
+    ocr,
     save,
     save_as,
 
@@ -72,7 +73,7 @@ const groups = [_][]const Item{
     &.{ .size_down, .size_value, .size_up },
     &.{ .undo, .redo },
 };
-const right_items = [_]Item{ .zoom, .copy, .save, .save_as };
+const right_items = [_]Item{ .zoom, .copy, .ocr, .save, .save_as };
 
 fn itemWidth(it: Item) f64 {
     return switch (it) {
@@ -156,13 +157,17 @@ pub const State = struct {
     hover: ?Item = null,
     pressed: ?Item = null,
     popover: bool = false,
+    palette: [8]Color = default_palette,
+    /// Copy text is running.
+    busy_ocr: bool = false,
 
     pub fn hash(s: State) u64 {
         var h = std.hash.Wyhash.init(0);
         h.update(std.mem.asBytes(&s.tool));
         h.update(std.mem.asBytes(&s.color));
         h.update(std.mem.asBytes(&s.size));
-        h.update(&.{ @intFromBool(s.can_undo), @intFromBool(s.can_redo), @intFromBool(s.popover) });
+        h.update(&.{ @intFromBool(s.can_undo), @intFromBool(s.can_redo), @intFromBool(s.popover), @intFromBool(s.busy_ocr) });
+        h.update(std.mem.asBytes(&s.palette));
         h.update(std.mem.asBytes(&s.zoom_pct));
         hashItem(&h, s.hover);
         hashItem(&h, s.pressed);
@@ -174,9 +179,9 @@ pub const State = struct {
             h.update(&.{0xff});
             return;
         };
-        h.update(&.{@intFromEnum(std.meta.activeTag(v))});
+        h.update(&.{@backingInt(std.meta.activeTag(v))});
         switch (v) {
-            .tool => |t| h.update(&.{@intFromEnum(t)}),
+            .tool => |t| h.update(&.{@backingInt(t)}),
             .swatch => |i| h.update(&.{i}),
             else => {},
         }
@@ -252,11 +257,11 @@ pub fn draw(cr: *c.cairo_t, l: *const Layout, s: State, width: f64) void {
                 rgb(cr, theme.fg);
                 icons.draw(cr, toolIcon(t), slot.x + 5, slot.y + 5, 22);
             },
-            .swatch => |i| drawSwatch(cr, slot, palette[i], s.color.eql(palette[i]), hovered),
+            .swatch => |i| drawSwatch(cr, slot, s.palette[i], s.color.eql(s.palette[i]), hovered),
             .custom => {
                 const cx = slot.x + slot.w / 2;
                 const cy = slot.y + slot.h / 2;
-                const selected = !isPalette(s.color);
+                const selected = !isPalette(&s.palette, s.color);
                 if (selected or hovered or s.popover) ring(cr, cx, cy, 10.5, if (selected or s.popover) theme.accent else theme.dim);
                 icons.hueRing(cr, cx, cy, 8);
                 if (selected) {
@@ -297,11 +302,13 @@ pub fn draw(cr: *c.cairo_t, l: *const Layout, s: State, width: f64) void {
                 rgb(cr, theme.fg);
                 label(cr, txt, slot.x, slot.y, slot.w - 4, slot.h, 12, true);
             },
-            .copy, .save, .save_as => {
-                button(cr, slot, hovered, pressed);
-                rgb(cr, theme.fg);
+            .copy, .ocr, .save, .save_as => {
+                const busy = slot.item == .ocr and s.busy_ocr;
+                button(cr, slot, hovered and !busy, pressed or busy);
+                rgb(cr, if (busy) theme.accent else theme.fg);
                 const ic: Icon = switch (slot.item) {
                     .copy => .copy,
+                    .ocr => .ocr,
                     .save => .save,
                     else => .save_as,
                 };
@@ -318,8 +325,8 @@ fn button(cr: *c.cairo_t, slot: Slot, hovered: bool, pressed: bool) void {
     c.cairo_fill(cr);
 }
 
-fn isPalette(col: Color) bool {
-    for (palette) |p| if (p.eql(col)) return true;
+fn isPalette(pal: *const [8]Color, col: Color) bool {
+    for (pal) |p| if (p.eql(col)) return true;
     return false;
 }
 
@@ -402,6 +409,7 @@ pub fn tooltip(item: Item, buf: []u8) []const u8 {
         .redo => "Redo   Ctrl+Shift+Z",
         .zoom => "Fit   Ctrl+0     100%   Ctrl+1",
         .copy => "Copy   Ctrl+C",
+        .ocr => "Copy text (OCR)   Ctrl+Shift+C",
         .save => "Save   Ctrl+S",
         .save_as => "Save as\u{2026}   Ctrl+Shift+S",
     };
@@ -410,7 +418,7 @@ pub fn tooltip(item: Item, buf: []u8) []const u8 {
 test "layout hit-tests and stays inside its minimum width" {
     const w = minWidth();
     const l = layout(w);
-    try std.testing.expect(l.n == 3 + 5 + 2 + 2 + 9 + 3 + 2 + 4);
+    try std.testing.expect(l.n == 3 + 5 + 2 + 2 + 9 + 3 + 2 + 5);
     const pen = l.find(.{ .tool = .pen }).?;
     try std.testing.expect(l.hit(pen.x + 2, pen.y + 2).?.eql(.{ .tool = .pen }));
     const last = l.slots[l.n - 1];

@@ -13,7 +13,7 @@ const Obj = doc_mod.Obj;
 const Pt = doc_mod.Pt;
 const effects = @import("effects.zig");
 
-pub const font_family = "Sans Bold";
+pub const default_font = "Sans Bold";
 
 const Effect = struct { img: Image, surf: *c.cairo_surface_t };
 
@@ -25,8 +25,10 @@ pub const Renderer = struct {
     /// stale.
     effects: std.AutoHashMapUnmanaged(u32, Effect) = .empty,
     font_opts: *c.cairo_font_options_t,
+    /// Pango font description for text objects.
+    font: [:0]const u8 = default_font,
 
-    pub fn init(gpa: Allocator, base: *const Image) !Renderer {
+    pub fn init(gpa: Allocator, base: *const Image, font: [:0]const u8) !Renderer {
         const surf = c.cairo_image_surface_create_for_data(base.pixels.ptr, c.CAIRO_FORMAT_ARGB32, @intCast(base.width), @intCast(base.height), @intCast(base.stride)) orelse return error.CairoFailed;
         if (c.cairo_surface_status(surf) != c.CAIRO_STATUS_SUCCESS) return error.CairoFailed;
         // Unhinted metrics so a text box measures the same at every zoom level.
@@ -34,7 +36,7 @@ pub const Renderer = struct {
         c.cairo_font_options_set_hint_metrics(fo, c.CAIRO_HINT_METRICS_OFF);
         c.cairo_font_options_set_hint_style(fo, c.CAIRO_HINT_STYLE_NONE);
         c.cairo_font_options_set_antialias(fo, c.CAIRO_ANTIALIAS_GRAY);
-        return .{ .gpa = gpa, .base = base, .base_surf = surf, .font_opts = fo };
+        return .{ .gpa = gpa, .base = base, .base_surf = surf, .font_opts = fo, .font = font };
     }
 
     pub fn deinit(r: *Renderer) void {
@@ -166,7 +168,7 @@ pub const Renderer = struct {
         c.pango_cairo_context_set_font_options(ctx, r.font_opts);
         c.pango_context_set_round_glyph_positions(ctx, 0);
         c.pango_layout_context_changed(l);
-        const desc = c.pango_font_description_from_string(font_family);
+        const desc = c.pango_font_description_from_string(r.font);
         defer c.pango_font_description_free(desc);
         c.pango_font_description_set_absolute_size(desc, @as(f64, size) * c.PANGO_SCALE);
         c.pango_layout_set_font_description(l, desc);
@@ -292,7 +294,7 @@ test "flatten paints annotations over the crop" {
     defer base.deinit(gpa);
     @memset(base.pixels, 0xff); // opaque white
     base.is_opaque = true;
-    var r = try Renderer.init(gpa, &base);
+    var r = try Renderer.init(gpa, &base, default_font);
     defer r.deinit();
     var d = Doc.init(gpa, 40, 20);
     defer d.deinit();
@@ -315,7 +317,7 @@ test "text measures wider for more characters" {
     var base = try Image.alloc(gpa, 4, 4);
     defer base.deinit(gpa);
     @memset(base.pixels, 0);
-    var r = try Renderer.init(gpa, &base);
+    var r = try Renderer.init(gpa, &base, default_font);
     defer r.deinit();
     const a = r.measureText("Hi", 20, .{ 0, 0 });
     const b = r.measureText("Hello there", 20, .{ 0, 0 });

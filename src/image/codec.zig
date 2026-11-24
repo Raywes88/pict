@@ -32,14 +32,25 @@ pub const Format = enum {
         if (std.mem.eql(u8, low, "webp")) return .webp;
         return null;
     }
+
+    /// "png", "jpg"/"jpeg" or "webp" (case-insensitive).
+    pub fn fromName(name: []const u8) ?Format {
+        if (name.len == 0 or name.len > 6) return null;
+        var buf: [8]u8 = undefined;
+        buf[0] = 'x';
+        buf[1] = '.';
+        @memcpy(buf[2..][0..name.len], name);
+        return fromPath(buf[0 .. name.len + 2]);
+    }
 };
 
-pub const jpeg_quality = 92;
+pub const default_jpeg_quality = 92;
 
-pub fn encode(gpa: Allocator, img: Image, format: Format) ![]u8 {
+/// `jpeg_quality` (1-100) applies to JPEG only; WebP is lossless.
+pub fn encode(gpa: Allocator, img: Image, format: Format, jpeg_quality: u8) ![]u8 {
     return switch (format) {
         .png => png.encode(gpa, img),
-        .jpeg => encodeJpeg(gpa, img, jpeg_quality),
+        .jpeg => encodeJpeg(gpa, img, std.math.clamp(jpeg_quality, 1, 100)),
         .webp => encodeWebp(gpa, img),
     };
 }
@@ -175,7 +186,7 @@ test "webp round-trips losslessly" {
     const gpa = testing.allocator;
     var img = try gradient(gpa);
     defer img.deinit(gpa);
-    const bytes = try encode(gpa, img, .webp);
+    const bytes = try encode(gpa, img, .webp, 92);
     defer gpa.free(bytes);
     var back = try decode(gpa, bytes);
     defer back.deinit(gpa);
@@ -187,7 +198,7 @@ test "jpeg round-trips approximately" {
     const gpa = testing.allocator;
     var img = try gradient(gpa);
     defer img.deinit(gpa);
-    const bytes = try encode(gpa, img, .jpeg);
+    const bytes = try encode(gpa, img, .jpeg, 92);
     defer gpa.free(bytes);
     var back = try decode(gpa, bytes);
     defer back.deinit(gpa);

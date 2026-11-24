@@ -43,18 +43,39 @@ const icons = @import("icons.zig");
 const autocopy = @import("autocopy.zig");
 const AutoCopy = autocopy.AutoCopy;
 const portal = @import("portal.zig");
+const OcrJob = @import("ocrjob.zig").OcrJob;
+const ocrjob = @import("ocrjob.zig");
+const clipboard = @import("../clipboard.zig");
+const ocr = @import("../ocr.zig");
 
 pub const Options = struct {
     io: Io,
-    /// File that Ctrl+S writes. Null: a new file in the default directory.
+    /// File that Ctrl+S writes. Null: a new file in `save_dir`.
     path: ?[]const u8 = null,
-    home: ?[]const u8 = null,
+    /// Absolute directory for new files (and where Save As starts).
+    save_dir: ?[]const u8 = null,
+    /// strftime(3) template for new file names.
+    filename: [:0]const u8 = "Screenshot_%Y-%m-%d_%H-%M-%S",
+    /// Format for new files; Save As picks from the chosen name.
+    format: codec.Format = .png,
+    jpeg_quality: u8 = codec.default_jpeg_quality,
     /// Buffer px per logical px the image was captured at, so 100% maps 1:1.
     image_scale: f64 = 1,
     /// Largest logical window size.
     max_size: [2]f64 = .{ 1600, 1000 },
     /// Re-copy to the clipboard after every edit.
     auto_copy: bool = true,
+    /// Ask for a second Esc before discarding unsaved changes.
+    confirm_close: bool = true,
+    tool: Tool = .pen,
+    /// Pango font for the text tool.
+    font: [:0]const u8 = "Sans Bold",
+    palette: [8]Color = toolbar.default_palette,
+    highlighter_color: Color = toolbar.default_palette[2],
+    /// Starting size per tool (image px).
+    sizes: [@typeInfo(Tool).@"enum".field_names.len]f32 = defaultSizes(),
+    /// Tesseract language(s) for Copy text.
+    ocr_language: [:0]const u8 = "eng",
     keep_stderr: bool = false,
     /// PICT_TEST_EDITOR: scripted input for automated tests (see `Script`).
     test_script: ?[]const u8 = null,
@@ -69,6 +90,12 @@ const close_confirm_ms = 3000;
 const toast_ms = 2200;
 
 const size_steps = [_]f32{ 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64, 80, 96, 128 };
+
+fn defaultSizes() [@typeInfo(Tool).@"enum".field_names.len]f32 {
+    var s: [@typeInfo(Tool).@"enum".field_names.len]f32 = undefined;
+    for (&s, 0..) |*v, i| v.* = defaultSize(@fromBackingInt(@intCast(i)));
+    return s;
+}
 
 fn defaultSize(t: Tool) f32 {
     return switch (t) {
@@ -192,8 +219,8 @@ test_mods: ?struct { ctrl: bool, shift: bool } = null,
 tool: Tool = .pen,
 prev_tool: Tool = .pen,
 sizes: [@typeInfo(Tool).@"enum".field_names.len]f32 = undefined,
-ink: Color = toolbar.palette[0],
-highlight: Color = toolbar.palette[2],
+ink: Color = toolbar.default_palette[0],
+highlight: Color = toolbar.default_palette[2],
 zoom: f64 = 1,
 pan: [2]f64 = .{ 0, 0 },
 fit: bool = true,
@@ -216,6 +243,7 @@ quit: bool = false,
 
 ac: AutoCopy,
 dialog: ?*portal.SaveDialog = null,
+ocr_job: ?*OcrJob = null,
 script: ?Script = null,
 
 /// Show the editor for `img` until the window is closed. `img` must outlive the call.
@@ -232,12 +260,19 @@ pub fn run(client: *Client, img: *const Image, opts: Options) !void {
         .opts = opts,
         .img = img,
         .doc = Doc.init(gpa, img.width, img.height),
-        .rend = try Renderer.init(gpa, img),
+        .rend = try Renderer.init(gpa, img, opts.font),
         .ac = try AutoCopy.init(opts.auto_copy, 0, opts.keep_stderr),
         .scale = opts.image_scale,
     };
     defer ed.teardown();
-    for (&ed.sizes, 0..) |*s, i| s.* = defaultSize(@enumFromInt(i));
+    ed.sizes = opts.sizes;
+    // Crop and picker have no size; keep them at 0 whatever the caller passed.
+    ed.sizes[@backingInt(Tool.crop)] = 0;
+    ed.sizes[@backingInt(Tool.picker)] = 0;
+    ed.ink = opts.palette[0];
+    ed.highlight = opts.highlighter_color;
+    ed.tool = if (opts.tool == .crop or opts.tool == .picker) .pen else opts.tool;
+    ed.prev_tool = ed.tool;
     if (opts.path) |p| ed.path = try gpa.dupe(u8, p);
     if (opts.test_script) |s| ed.script = Script.init(s);
     ed.xkb_ctx = c.xkb_context_new(c.XKB_CONTEXT_NO_FLAGS);
@@ -291,6 +326,7 @@ fn teardown(ed: *Editor) void {
     ed.cancelGesture();
     if (ed.text) |*t| t.buf.deinit(ed.gpa);
     if (ed.dialog) |d| d.deinit();
+    if (ed.ocr_job) |j| j.cancel();
     ed.ac.deinit();
     if (ed.sv_surf) |s| c.cairo_surface_destroy(s);
     if (ed.scene) |s| c.cairo_surface_destroy(s);
@@ -351,7 +387,7 @@ fn loop(ed: *Editor) !void {
         }
         _ = display.flush();
 
-        var fds: [3]posix.pollfd = undefined;
+        var fds: [4]posix.pollfd = undefined;
         var n: usize = 0;
         fds[n] = .{ .fd = wl_fd, .events = posix.POLL.IN, .revents = 0 };
         n += 1;
@@ -363,6 +399,10 @@ fn loop(ed: *Editor) !void {
         const dlg_i = n;
         if (ed.dialog) |d| {
             fds[n] = .{ .fd = d.fd(), .events = d.events(), .revents = 0 };
+            n += 1;
+        }
+        if (ed.ocr_job) |j| {
+            fds[n] = .{ .fd = j.fd(), .events = posix.POLL.IN, .revents = 0 };
             n += 1;
         }
         const timeout = ed.nextTimeout(now());
@@ -391,6 +431,10 @@ fn nextTimeout(ed: *Editor, t: i64) i32 {
 }
 
 fn tick(ed: *Editor, t: i64) void {
+    if (ed.ocr_job) |j| if (j.take()) |res| {
+        ed.ocr_job = null;
+        ed.ocrDone(res);
+    };
     if (ed.repeat_key) |k| if (t >= ed.repeat_next) {
         ed.repeat_next = t + @divTrunc(1000, @max(1, ed.repeat_rate));
         ed.onKeyEvdev(k);
@@ -754,6 +798,8 @@ fn toolbarState(ed: *const Editor) toolbar.State {
         .hover = ed.hover,
         .pressed = ed.pressed,
         .popover = ed.popover,
+        .palette = ed.opts.palette,
+        .busy_ocr = ed.ocr_job != null,
     };
 }
 
@@ -1104,7 +1150,7 @@ fn curColor(ed: *const Editor) Color {
 
 fn curSize(ed: *const Editor) f32 {
     if (ed.text) |t| return t.size;
-    return ed.sizes[@intFromEnum(ed.tool)];
+    return ed.sizes[@backingInt(ed.tool)];
 }
 
 /// Apply a colour to the current tool (and the text being edited). `from_palette`
@@ -1137,7 +1183,7 @@ fn stepSize(ed: *Editor, dir: i32) void {
         }
     }
     if (ed.text) |*t| t.size = next;
-    ed.sizes[@intFromEnum(ed.tool)] = next;
+    ed.sizes[@backingInt(ed.tool)] = next;
     ed.dirty = true;
 }
 
@@ -1268,6 +1314,44 @@ fn copy(ed: *Editor) void {
     ed.toastf("Copied to clipboard", .{});
 }
 
+/// Ctrl+Shift+C: recognise the text in the edited image and copy it.
+fn copyText(ed: *Editor) void {
+    ed.finishPending();
+    if (ed.ocr_job != null) return;
+    const img = ed.rend.flatten(ocrjob.alloc, &ed.doc) catch |err| {
+        ed.toastf("Copy text failed: {t}", .{err});
+        return;
+    };
+    ed.ocr_job = OcrJob.start(img, ed.opts.ocr_language, ed.scale) catch |err| {
+        var m = img;
+        m.deinit(ocrjob.alloc);
+        ed.toastf("Copy text failed: {t}", .{err});
+        return;
+    };
+    ed.toastf("Reading text\u{2026}", .{});
+    ed.toast_until = std.math.maxInt(i64);
+}
+
+fn ocrDone(ed: *Editor, res: anyerror![]u8) void {
+    const text = res catch |err| {
+        ed.toastf("{s}", .{ocr.describe(err)});
+        return;
+    };
+    defer ocrjob.alloc.free(text);
+    if (text.len == 0) {
+        ed.toastf("No text found", .{});
+        return;
+    }
+    // Stop a pending image copy from replacing the text; the next edit re-copies.
+    ed.ac.yieldTo(ed.doc.rev);
+    clipboard.copyText(text, ed.opts.keep_stderr) catch |err| {
+        ed.toastf("Copy text failed: {t}", .{err});
+        return;
+    };
+    const lines = ocr.lineCount(text);
+    ed.toastf("Copied {d} line{s} of text", .{ lines, if (lines == 1) "" else "s" });
+}
+
 fn saveCurrent(ed: *Editor) void {
     ed.finishPending();
     if (ed.path) |p| {
@@ -1276,15 +1360,15 @@ fn saveCurrent(ed: *Editor) void {
         ed.saveTo(dup) catch |err| ed.toastf("Save failed: {t}", .{err});
         return;
     }
-    const home = ed.opts.home orelse {
-        ed.toastf("Save failed: HOME is not set", .{});
+    const dir = ed.opts.save_dir orelse {
+        ed.toastf("Save failed: no save directory (is HOME set?)", .{});
         return;
     };
     var img = ed.rend.flatten(ed.gpa, &ed.doc) catch return;
     defer img.deinit(ed.gpa);
-    const bytes = codec.encode(ed.gpa, img, .png) catch return;
+    const bytes = codec.encode(ed.gpa, img, ed.opts.format, ed.opts.jpeg_quality) catch return;
     defer ed.gpa.free(bytes);
-    const path = save_mod.saveDefault(ed.opts.io, ed.gpa, home, bytes, "png") catch |err| {
+    const path = save_mod.saveNew(ed.opts.io, ed.gpa, .{ .dir = dir, .template = ed.opts.filename }, bytes, ed.opts.format.ext()) catch |err| {
         ed.toastf("Save failed: {t}", .{err});
         return;
     };
@@ -1294,10 +1378,10 @@ fn saveCurrent(ed: *Editor) void {
 }
 
 fn saveTo(ed: *Editor, path: []const u8) !void {
-    const fmt = codec.Format.fromPath(path) orelse .png;
+    const fmt = codec.Format.fromPath(path) orelse ed.opts.format;
     var img = try ed.rend.flatten(ed.gpa, &ed.doc);
     defer img.deinit(ed.gpa);
-    const bytes = try codec.encode(ed.gpa, img, fmt);
+    const bytes = try codec.encode(ed.gpa, img, fmt, ed.opts.jpeg_quality);
     defer ed.gpa.free(bytes);
     const written = try save_mod.saveTo(ed.opts.io, ed.gpa, path, bytes);
     if (ed.path) |old| ed.gpa.free(old);
@@ -1313,16 +1397,16 @@ fn saveAs(ed: *Editor) void {
     var folder_buf: [512]u8 = undefined;
     var name: []const u8 = undefined;
     var folder: []const u8 = undefined;
-    var fmt: codec.Format = .png;
+    var fmt: codec.Format = ed.opts.format;
     if (ed.path) |p| {
         name = std.fs.path.basename(p);
         folder = std.fs.path.dirname(p) orelse "/";
-        fmt = codec.Format.fromPath(p) orelse .png;
+        fmt = codec.Format.fromPath(p) orelse ed.opts.format;
     } else {
-        var stamp: [96]u8 = undefined;
-        const s = save_mod.formatNow(&stamp, save_mod.default_template) catch "Screenshot";
-        name = std.fmt.bufPrint(&name_buf, "{s}.png", .{s}) catch "Screenshot.png";
-        folder = std.fmt.bufPrint(&folder_buf, "{s}/{s}", .{ ed.opts.home orelse "/", save_mod.default_subdir }) catch "/";
+        var stamp: [256]u8 = undefined;
+        const s = save_mod.fileStem(&stamp, ed.opts.filename) catch "Screenshot";
+        name = std.fmt.bufPrint(&name_buf, "{s}.{s}", .{ s, fmt.ext() }) catch "Screenshot.png";
+        folder = std.fmt.bufPrint(&folder_buf, "{s}", .{ed.opts.save_dir orelse "/"}) catch "/";
     }
     ed.dialog = portal.SaveDialog.start(ed.gpa, name, folder, fmt) catch |err| blk: {
         ed.toastf("The file dialog is unavailable ({t})", .{err});
@@ -1332,7 +1416,7 @@ fn saveAs(ed: *Editor) void {
 
 fn requestClose(ed: *Editor) void {
     const t = now();
-    if (ed.doc.dirty() and t > ed.close_armed_until) {
+    if (ed.opts.confirm_close and ed.doc.dirty() and t > ed.close_armed_until) {
         ed.close_armed_until = t + close_confirm_ms;
         ed.toastf("Unsaved changes. Close again to discard, Ctrl+S to save", .{});
         return;
@@ -1344,7 +1428,7 @@ fn requestClose(ed: *Editor) void {
 fn activate(ed: *Editor, item: Item) void {
     switch (item) {
         .tool => |t| ed.setTool(t),
-        .swatch => |i| ed.setColor(toolbar.palette[i], true),
+        .swatch => |i| ed.setColor(ed.opts.palette[i], true),
         .custom => {
             ed.popover = !ed.popover;
             if (ed.popover) {
@@ -1361,6 +1445,7 @@ fn activate(ed: *Editor, item: Item) void {
             ed.setZoomAt(1 / ed.scale, ed.canvasCenter());
         } else ed.doFit(),
         .copy => ed.copy(),
+        .ocr => ed.copyText(),
         .save => ed.saveCurrent(),
         .save_as => ed.saveAs(),
     }
@@ -1644,7 +1729,7 @@ fn textClick(ed: *Editor, p: Pt) void {
             return;
         }
     }
-    const size = ed.sizes[@intFromEnum(Tool.text)];
+    const size = ed.sizes[@backingInt(Tool.text)];
     ed.text = .{ .at = .{ p[0], p[1] - size * 0.6 }, .color = ed.ink, .size = size };
 }
 
@@ -1791,7 +1876,7 @@ fn onKey(ed: *Editor, sym: u32, base: u32, utf8: []const u8) void {
         switch (base) {
             c.XKB_KEY_z => if (shift) ed.redo() else ed.undo(),
             c.XKB_KEY_y => ed.redo(),
-            c.XKB_KEY_c => ed.copy(),
+            c.XKB_KEY_c => if (shift) ed.copyText() else ed.copy(),
             c.XKB_KEY_s => if (shift) ed.saveAs() else ed.saveCurrent(),
             c.XKB_KEY_0 => ed.doFit(),
             c.XKB_KEY_1 => ed.setZoomAt(1 / ed.scale, ed.canvasCenter()),
@@ -1874,7 +1959,7 @@ fn onKey(ed: *Editor, sym: u32, base: u32, utf8: []const u8) void {
         else => null,
     };
     if (t) |tool| return ed.setTool(tool);
-    if (base >= c.XKB_KEY_1 and base <= c.XKB_KEY_8) return ed.setColor(toolbar.palette[base - c.XKB_KEY_1], true);
+    if (base >= c.XKB_KEY_1 and base <= c.XKB_KEY_8) return ed.setColor(ed.opts.palette[base - c.XKB_KEY_1], true);
     switch (base) {
         c.XKB_KEY_bracketleft => ed.stepSize(-1),
         c.XKB_KEY_bracketright => ed.stepSize(1),
@@ -2066,11 +2151,11 @@ fn runCommand(ed: *Editor, cmd: []const u8) !void {
         ed.setTool(std.meta.stringToEnum(Tool, name) orelse return error.BadTool);
     } else if (eq(op, "color")) {
         const n = try std.fmt.parseInt(u8, it.next() orelse return error.MissingArg, 10);
-        ed.setColor(toolbar.palette[n - 1], true);
+        ed.setColor(ed.opts.palette[n - 1], true);
     } else if (eq(op, "size")) {
         const v = try std.fmt.parseFloat(f32, it.next() orelse return error.MissingArg);
         if (ed.text) |*t| t.size = v;
-        ed.sizes[@intFromEnum(ed.tool)] = v;
+        ed.sizes[@backingInt(ed.tool)] = v;
     } else if (eq(op, "fit")) {
         ed.doFit();
     } else if (eq(op, "zoom")) {

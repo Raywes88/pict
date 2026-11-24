@@ -16,13 +16,23 @@ const Layout = layout_mod.Layout;
 const compose = @import("compose.zig").compose;
 const codec = @import("image/codec.zig");
 const Editor = @import("editor/Editor.zig");
+const config = @import("config.zig");
+const Config = config.Config;
+const ocr = @import("ocr.zig");
+const notify = @import("notify.zig");
+const binds = @import("binds.zig");
 
 pub const version = "0.1.0";
 
 pub fn main(init: std.process.Init) u8 {
-    const args = init.minimal.args.toSlice(init.arena.allocator()) catch return 2;
+    const arena = init.arena.allocator();
+    const args = init.minimal.args.toSlice(arena) catch return 2;
+    const argv = if (args.len > 0) args[1..] else args;
+    // The forked clipboard owner skips the config.
+    const internal = argv.len > 0 and std.mem.eql(u8, argv[0], "__serve-clipboard");
+    const cfg: Config = if (internal) .{} else config.load(init.io, arena, init.environ_map).config;
     var diag: cli.Diag = .{};
-    const action = cli.parse(if (args.len > 0) args[1..] else args, &diag) catch {
+    const action = cli.parse(argv, baseOptions(cfg), &diag) catch {
         std.debug.print("pict: {s}: {s}\n\n{s}", .{ diag.arg, diag.msg, cli.usage });
         return 2;
     };
@@ -35,8 +45,19 @@ pub fn main(init: std.process.Init) u8 {
             writeStdout(init.io, "pict " ++ version ++ "\n") catch {};
             return 0;
         },
-        .serve_clipboard => |s| return clipboard.serve(s.data_fd, s.ready_fd),
-        .run => |o| return run(init, o) catch |err| {
+        .print_config => {
+            writeStdout(init.io, config.default_text) catch {};
+            return 0;
+        },
+        .print_niri_binds => {
+            printNiriBinds(init) catch |err| {
+                std.debug.print("pict: {s}\n", .{describe(err)});
+                return 2;
+            };
+            return 0;
+        },
+        .serve_clipboard => |s| return clipboard.serve(s.data_fd, s.ready_fd, if (s.text) .text else .png),
+        .run => |o| return run(init, &cfg, o) catch |err| {
             std.debug.print("pict: {s}\n", .{describe(err)});
             return 2;
         },
@@ -45,11 +66,24 @@ pub fn main(init: std.process.Init) u8 {
 
 const Outcome = enum(u8) { captured = 0, cancelled = 1 };
 
-fn run(init: std.process.Init, o: cli.Options) !u8 {
+fn baseOptions(cfg: Config) cli.Options {
+    return .{
+        .mode = cfg.mode,
+        .cursor = cfg.cursor,
+        .delay_s = cfg.delay,
+        .save = cfg.save,
+        .copy = cfg.copy,
+        .editor = cfg.editor,
+        .format = cfg.format,
+        .jpeg_quality = cfg.jpeg_quality,
+    };
+}
+
+fn run(init: std.process.Init, cfg: *const Config, o: cli.Options) !u8 {
     const io = init.io;
     const gpa = init.gpa;
 
-    if (o.edit_path) |p| return editFile(init, o, p);
+    if (o.edit_path) |p| return editFile(init, cfg, o, p);
 
     var t = Timings.init(io, o.timings);
     if (o.delay_s > 0) try io.sleep(.fromSeconds(o.delay_s), .awake);
@@ -122,6 +156,11 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
         },
     }
     defer result.deinit(gpa);
+    const keep_stderr = init.environ_map.get("PICT_DEBUG") != null;
+
+    if (o.ocr) {
+        return ocrResult(init, cfg, o, result, image_scale, &t);
+    }
 
     const bytes = try png.encode(gpa, result);
     defer gpa.free(bytes);
@@ -134,48 +173,117 @@ fn run(init: std.process.Init, o: cli.Options) !u8 {
             if (std.mem.eql(u8, p, "-")) {
                 try Io.File.stdout().writeStreamingAll(io, bytes);
             } else {
-                saved_path = try save.saveTo(io, gpa, p, bytes);
+                const fmt = codec.Format.fromPath(p) orelse o.format;
+                saved_path = try saveEncoded(io, gpa, result, bytes, fmt, o.jpeg_quality, .{ .path = p });
                 try printStdout(io, "{s}\n", .{saved_path.?});
             }
         } else {
-            const home = init.environ_map.get("HOME") orelse return error.NoHome;
-            saved_path = try save.saveDefault(io, gpa, home, bytes, "png");
+            const dir = try cfg.saveDir(gpa, init.environ_map.get("HOME"));
+            defer gpa.free(dir);
+            saved_path = try saveEncoded(io, gpa, result, bytes, o.format, o.jpeg_quality, .{ .new = .{ .dir = dir, .template = cfg.filename } });
             try printStdout(io, "{s}\n", .{saved_path.?});
         }
         t.mark("save");
     }
 
     if (o.copy) {
-        try clipboard.copyPng(bytes, init.environ_map.get("PICT_DEBUG") != null);
+        try clipboard.copyPng(bytes, keep_stderr);
         t.mark("clipboard");
     }
 
-    t.report(result.width, result.height, bytes.len);
+    t.report(result.width, result.height, bytes.len, "PNG");
 
     if (o.editor) {
-        try Editor.run(client, &result, editorOptions(init, o, ipc, client, saved_path, image_scale));
+        try Editor.run(client, &result, editorOptions(init, cfg, o, ipc, client, saved_path, image_scale));
     }
     return @backingInt(Outcome.captured);
 }
 
-fn editorOptions(init: std.process.Init, o: cli.Options, ipc: ?niri.Ipc, client: *Client, path: ?[]const u8, image_scale: f64) Editor.Options {
+const SaveWhere = union(enum) { path: []const u8, new: save.Target };
+
+/// Write the capture in `fmt`, reusing the already-encoded PNG when that's the format.
+fn saveEncoded(io: Io, gpa: Allocator, img: Image, png_bytes: []const u8, fmt: codec.Format, quality: u8, where: SaveWhere) ![]u8 {
+    var other: ?[]u8 = null;
+    defer if (other) |b| gpa.free(b);
+    const bytes = if (fmt == .png) png_bytes else blk: {
+        other = try codec.encode(gpa, img, fmt, quality);
+        break :blk other.?;
+    };
+    return switch (where) {
+        .path => |p| save.saveTo(io, gpa, p, bytes),
+        .new => |tgt| save.saveNew(io, gpa, tgt, bytes, fmt.ext()),
+    };
+}
+
+/// `--ocr`: print the text, copy it, and say so in a notification.
+fn ocrResult(init: std.process.Init, cfg: *const Config, o: cli.Options, img: Image, image_scale: f64, t: *Timings) !u8 {
+    const gpa = init.gpa;
+    const text = ocr.recognize(gpa, img, cfg.ocr_language, image_scale) catch |err| {
+        if (cfg.ocr_notify) notify.send("pict: text recognition failed", ocr.describe(err));
+        std.debug.print("pict: {s}\n", .{ocr.describe(err)});
+        return 2;
+    };
+    defer gpa.free(text);
+    t.mark("ocr");
+    if (text.len == 0) {
+        if (cfg.ocr_notify) notify.send("No text found", "Nothing was copied.");
+        std.debug.print("pict: no text found\n", .{});
+        t.report(img.width, img.height, 0, "text");
+        return @backingInt(Outcome.captured);
+    }
+    try printStdout(init.io, "{s}\n", .{text});
+    if (o.copy) {
+        try clipboard.copyText(text, init.environ_map.get("PICT_DEBUG") != null);
+        t.mark("clipboard");
+        if (cfg.ocr_notify) {
+            var buf: [96]u8 = undefined;
+            const lines = ocr.lineCount(text);
+            const summary = std.fmt.bufPrint(&buf, "Copied {d} line{s} of text", .{ lines, if (lines == 1) "" else "s" }) catch "Copied text";
+            notify.send(summary, preview(text));
+        }
+    }
+    t.report(img.width, img.height, text.len, "text");
+    return @backingInt(Outcome.captured);
+}
+
+/// The first few lines, for a notification body.
+fn preview(text: []const u8) []const u8 {
+    var end: usize = 0;
+    var lines: usize = 0;
+    while (end < text.len and lines < 4) : (end += 1) {
+        if (text[end] == '\n') lines += 1;
+    }
+    return text[0..@min(end, 300)];
+}
+
+fn editorOptions(init: std.process.Init, cfg: *const Config, o: cli.Options, ipc: ?niri.Ipc, client: *Client, path: ?[]const u8, image_scale: f64) Editor.Options {
     const out = focusedOutput(ipc, client);
     const lw: f64 = @floatFromInt(if (out.logical_w > 0) out.logical_w else 1920);
     const lh: f64 = @floatFromInt(if (out.logical_h > 0) out.logical_h else 1080);
     return .{
         .io = init.io,
         .path = path,
-        .home = init.environ_map.get("HOME"),
+        .save_dir = cfg.saveDir(init.arena.allocator(), init.environ_map.get("HOME")) catch null,
+        .filename = cfg.filename,
+        .format = o.format,
+        .jpeg_quality = o.jpeg_quality,
         .image_scale = image_scale,
         .max_size = .{ lw * 0.9, lh * 0.9 },
-        .auto_copy = o.copy,
+        .auto_copy = o.copy and cfg.auto_copy,
+        .confirm_close = cfg.confirm_close,
+        .tool = cfg.tool,
+        .font = cfg.font,
+        .palette = cfg.palette,
+        .highlighter_color = cfg.highlighter_color,
+        .sizes = cfg.sizes,
+        .ocr_language = cfg.ocr_language,
         .keep_stderr = init.environ_map.get("PICT_DEBUG") != null,
         .test_script = init.environ_map.get("PICT_TEST_EDITOR"),
     };
 }
 
 /// `pict --edit <path>`: open an existing image.
-fn editFile(init: std.process.Init, o: cli.Options, path: []const u8) !u8 {
+fn editFile(init: std.process.Init, cfg: *const Config, o: cli.Options, path: []const u8) !u8 {
     const io = init.io;
     const gpa = init.gpa;
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(512 * 1024 * 1024)) catch return error.CannotReadImage;
@@ -192,8 +300,40 @@ fn editFile(init: std.process.Init, o: cli.Options, path: []const u8) !u8 {
         @as(f64, @floatFromInt(@max(out.mode_w, out.mode_h))) / @as(f64, @floatFromInt(@max(out.logical_w, out.logical_h)))
     else
         1;
-    try Editor.run(client, &img, editorOptions(init, o, ipc, client, path, scale));
+    try Editor.run(client, &img, editorOptions(init, cfg, o, ipc, client, path, scale));
     return @backingInt(Outcome.captured);
+}
+
+/// `pict --print-niri-binds`.
+fn printNiriBinds(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+    const env = init.environ_map;
+    const path: ?[]const u8 = if (env.get("NIRI_CONFIG")) |p| p else if (env.get("XDG_CONFIG_HOME")) |x|
+        try std.fmt.allocPrint(arena, "{s}/niri/config.kdl", .{x})
+    else if (env.get("HOME")) |h|
+        try std.fmt.allocPrint(arena, "{s}/.config/niri/config.kdl", .{h})
+    else
+        null;
+    const text: ?[]const u8 = if (path) |p| Io.Dir.cwd().readFileAlloc(io, p, arena, .limited(4 << 20)) catch null else null;
+    const out = try binds.render(init.gpa, text, if (text != null) path else null, try exeName(init));
+    defer init.gpa.free(out);
+    try writeStdout(io, out);
+}
+
+/// "pict" when the first "pict" on $PATH is this binary, else this binary's full path.
+fn exeName(init: std.process.Init) ![]const u8 {
+    const arena = init.arena.allocator();
+    const self = std.process.executablePathAlloc(init.io, arena) catch return "pict";
+    const path_env = init.environ_map.get("PATH") orelse return self;
+    var it = std.mem.tokenizeScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        const cand = try std.fs.path.join(arena, &.{ dir, "pict" });
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const len = Io.Dir.cwd().realPathFile(init.io, cand, &buf) catch continue;
+        return if (std.mem.eql(u8, buf[0..len], self)) "pict" else self;
+    }
+    return self;
 }
 
 fn focusedOutput(ipc: ?niri.Ipc, client: *Client) *Client.Output {
@@ -306,6 +446,7 @@ fn describe(err: anyerror) []const u8 {
         error.UnknownImageFormat => "not a PNG, JPEG or WebP image",
         error.NoXdgShell => "compositor offers no xdg_wm_base; the editor needs it",
         error.WlCopyFailed => "clipboard: no data-control protocol and wl-copy failed",
+        error.TemplateTooLong => "the [output] filename template expands to more than 255 bytes",
         else => @errorName(err),
     };
 }
@@ -344,9 +485,9 @@ pub const Timings = struct {
         t.last = now;
     }
 
-    fn report(t: *Timings, w: u32, h: u32, png_len: usize) void {
+    fn report(t: *Timings, w: u32, h: u32, out_len: usize, what: []const u8) void {
         if (!t.enabled) return;
-        std.debug.print("pict timings ({d}x{d}, {d} KiB PNG):\n", .{ w, h, png_len / 1024 });
+        std.debug.print("pict timings ({d}x{d}, {d} KiB {s}):\n", .{ w, h, out_len / 1024, what });
         for (t.marks[0..t.n]) |m| std.debug.print("  {s:<10} {d:>8.2} ms\n", .{ m.name, ms(m.ns) });
         std.debug.print("  {s:<10} {d:>8.2} ms\n", .{ "total", ms(t.start.durationTo(t.last).toNanoseconds()) });
     }
@@ -373,4 +514,8 @@ test {
     _ = @import("editor/toolbar.zig");
     _ = @import("editor/portal.zig");
     _ = @import("editor/autocopy.zig");
+    _ = @import("config.zig");
+    _ = @import("ocr.zig");
+    _ = @import("notify.zig");
+    _ = @import("binds.zig");
 }

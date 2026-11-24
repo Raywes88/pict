@@ -101,6 +101,21 @@ pub const AutoCopy = struct {
         ac.copied_rev = rev;
     }
 
+    /// Something else (Copy text) now owns the clipboard as of `rev`: drop any pending
+    /// or in-flight copy, and don't copy again until the document changes.
+    pub fn yieldTo(ac: *AutoCopy, rev: u64) void {
+        if (ac.thread) |t| {
+            t.join();
+            ac.thread = null;
+            var b: [8]u8 = undefined;
+            _ = c.read(ac.wake_r, &b, b.len);
+            if (ac.job.bytes) |bytes| alloc.free(bytes);
+            ac.job.bytes = null;
+        }
+        ac.deadline = null;
+        ac.copied_rev = rev;
+    }
+
     /// At exit: make sure the clipboard holds the final edit.
     pub fn flush(ac: *AutoCopy, rev: u64, ctx: anytype) void {
         if (!ac.enabled) return;

@@ -9,6 +9,7 @@
 #include <png.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>

@@ -52,8 +52,13 @@ src/overlay/                  Overlay.zig (layer surfaces, render, input), selec
 src/clipboard.zig             re-exec'd data-control owner, wl-copy fallback
 src/niri.zig                  $NIRI_SOCKET JSON IPC
 src/save.zig                  default dir, strftime template, collision-safe names
-src/editor/                   Phase 3: Editor, doc, render, effects, toolbar, icons, autocopy, portal
+src/editor/                   Phase 3: Editor, doc, render, effects, toolbar, icons, autocopy, portal,
+                              ocrjob (Copy text on a worker thread)
 src/image/codec.zig           JPEG and WebP, format sniffing
+src/config.zig                Phase 4: config.toml (TOML subset parser), documented defaults
+src/ocr.zig                   Tesseract via dlopen, preprocessing, cleanup
+src/notify.zig                desktop notifications over sd-bus
+src/binds.zig                 --print-niri-binds, with a niri config scanner for conflicts
 ```
 
 Data flow: `capture` returns `[]Frame`, `overlay` returns a `Selection` in physical px,
@@ -170,5 +175,36 @@ standard dialog.
 
 ### Phase 4
 
-TOML config (the subset pict uses), `--print-niri-binds`, JPG/WebP defaults, filename templates,
-OCR via the tesseract C API.
+Config file, niri binds generator, OCR.
+
+**Status (2026-11-24):** built and verified on kotov.
+- **Config** (`config.zig`): a hand-written parser for the TOML subset pict needs (tables,
+  dotted tables, bare and quoted keys, basic and literal strings, ints with `_`, floats,
+  booleans, multi-line arrays, comments). Values are range-checked; a bad line is reported
+  with its line number and skipped. `--print-config` prints the documented default file, and a
+  unit test checks that it parses back to exactly the built-in defaults. The config builds the
+  base `cli.Options`, so every flag overrides it. Verified: a config with `mode = "fullscreen"`,
+  a custom `dir`, `format = "jpg"` and `copy = false` saved a JPEG there with no clipboard
+  change; an editor config with `tool = "arrow"`, a custom palette, `font = "Serif Italic"` and
+  sizes all applied.
+- **File names:** `save.Target` (directory + strftime template). '/' in an expanded name is
+  replaced, so a template can't write outside the directory. Save and Save As use the
+  configured format; Save As still picks the format from the chosen extension.
+- **Binds** (`binds.zig`): eight Windows-flavoured binds, each with fallback combos. A small
+  KDL scanner (strings, raw strings, comments, slashdash, brace depth) collects the existing
+  binds in the user's niri config; combos are normalised (Mod = Super, modifier order, key
+  case). Uses `"pict"` when the first `pict` on `$PATH` is this binary, else the full path.
+  Verified on kotov: `Mod+Shift+S` reported as already bound to pict, `Mod+Shift+T` (taken by
+  toggle-window-floating) fell back to `Mod+Alt+T`, and `niri validate` accepts the output both
+  on its own and through `include`.
+- **OCR** (`ocr.zig`): libtesseract is `dlopen`ed on first use, so it's an optional runtime
+  dependency and normal snips don't pay for loading it. Preprocessing: 2× Cairo upscale below
+  scale 1.5 (edge-padded), grayscale over white, invert when the mean is dark. Output cleanup
+  trims lines, collapses blank runs and drops punctuation specks. `--ocr` prints, copies text
+  (`clipboard.copyText`), and notifies over D-Bus (`notify.zig`). In the editor, Copy text
+  flattens on the main thread (redactions applied), recognises on a worker thread, and then
+  tells auto-copy to yield so a pending image copy can't overwrite the text.
+- **Verified:** a synthetic light-on-dark and dark-on-light test image was read exactly by the
+  editor's Copy text (text survived the editor exiting) and by `pict --ocr` over the overlay
+  (130 ms OCR, 190 ms end to end; swaync received the notification).
+- **Not tested by hand:** OCR on real-world screens (small UI fonts, code, mixed languages).

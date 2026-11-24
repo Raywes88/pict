@@ -19,6 +19,7 @@ pub const Icon = enum {
     undo,
     redo,
     copy,
+    ocr,
     save,
     save_as,
     minus,
@@ -144,6 +145,19 @@ pub fn draw(cr: *c.cairo_t, icon: Icon, x: f64, y: f64, size: f64) void {
             c.cairo_curve_to(cr, 4.5, 5.4, 5.4, 4.5, 6.5, 4.5);
             c.cairo_line_to(cr, 15.5, 4.5);
             c.cairo_stroke(cr);
+        },
+        .ocr => {
+            // Scan corners around a "T": copy the text in the image.
+            poly(cr, &.{ .{ 3.5, 8.5 }, .{ 3.5, 3.5 }, .{ 8.5, 3.5 } }, false);
+            c.cairo_stroke(cr);
+            poly(cr, &.{ .{ 15.5, 3.5 }, .{ 20.5, 3.5 }, .{ 20.5, 8.5 } }, false);
+            c.cairo_stroke(cr);
+            poly(cr, &.{ .{ 20.5, 15.5 }, .{ 20.5, 20.5 }, .{ 15.5, 20.5 } }, false);
+            c.cairo_stroke(cr);
+            poly(cr, &.{ .{ 8.5, 20.5 }, .{ 3.5, 20.5 }, .{ 3.5, 15.5 } }, false);
+            c.cairo_stroke(cr);
+            seg(cr, 8, 8, 16, 8);
+            seg(cr, 12, 8, 12, 16.5);
         },
         .save => {
             seg(cr, 12, 4, 12, 15);
