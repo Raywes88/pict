@@ -208,3 +208,11 @@ Config file, niri binds generator, OCR.
   editor's Copy text (text survived the editor exiting) and by `pict --ocr` over the overlay
   (130 ms OCR, 190 ms end to end; swaync received the notification).
 - **Not tested by hand:** OCR on real-world screens (small UI fonts, code, mixed languages).
+
+### Phase 5 — screen recording (planned)
+
+Spec: [RECORDING.md](RECORDING.md). In short: a wlr-screencopy streaming loop over a live
+region overlay, raw frames piped to `ffmpeg` (NVENC on kotov, VA-API on xarl, x264 fallback),
+MKV while recording and a remux to MP4 on stop, one bind that toggles start and stop through a
+control socket, and optional system/mic audio. It starts with a measurement spike (5.0) to
+settle whether shm and a pipe keep up at 30 fps.

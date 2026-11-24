@@ -5,9 +5,10 @@ a clone of windows snip tool written (vibe-coded) in zig for my wayland+niri des
 It's fast and native: raw Wayland, wl_shm and Cairo, with no toolkit and no GPU API. See
 [PLAN.md](PLAN.md) for the architecture and roadmap.
 
-**Status:** Phase 4. Region, freeform and window capture, monitor-spanning selections, an
-annotation editor that opens after each capture, a config file, a niri binds generator, and
-copying text out of a snip (OCR).
+**Status:** 1.0.0. Region, freeform, window and fullscreen capture, monitor-spanning
+selections, an annotation editor that opens after each capture, a config file, a niri binds
+generator, and copying text out of a snip (OCR). Screen recording is planned in
+[RECORDING.md](RECORDING.md).
 
 ## Build
 

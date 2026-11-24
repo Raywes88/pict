@@ -22,7 +22,7 @@ const ocr = @import("ocr.zig");
 const notify = @import("notify.zig");
 const binds = @import("binds.zig");
 
-pub const version = "0.1.0";
+pub const version = "1.0.0";
 
 pub fn main(init: std.process.Init) u8 {
     const arena = init.arena.allocator();
